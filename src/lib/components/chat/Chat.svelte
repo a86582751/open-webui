@@ -74,12 +74,22 @@
 		deleteChatById,
 		forkChatById,
 		getAllTags,
-		getChatById,
+		getChatByIdWindow,
+		getChatHistoryWindow,
 		getTagsById,
 		resolveChatMessageToolCall,
 		updateChatById,
+		updateChatByIdWindow,
 		updateChatFolderIdById
 	} from '$lib/apis/chats';
+	import {
+		DEFAULT_CHAT_MESSAGE_WINDOW,
+		isChatMessageLoaded,
+		mergeChatMessageEvent,
+		mergeChatHistoryWindow,
+		resolveLoadedCurrentMessageId,
+		serializeChatForWindowSave
+	} from '$lib/utils/chatHistoryWindow';
 	import { generateOpenAIChatCompletion } from '$lib/apis/openai';
 	import { processUrl, processWebSearch } from '$lib/apis/retrieval';
 	import {
@@ -125,6 +135,17 @@
 	import EmbeddedChatHistoryDropdown from './EmbeddedChatHistoryDropdown.svelte';
 	import InputVariablesModal from './MessageInput/InputVariablesModal.svelte';
 
+	type ChatHistoryState = {
+		currentId: string | null;
+		messages: Record<string, any>;
+		messageWindow?: {
+			loadedIds?: string[];
+			hasMore?: boolean;
+			[key: string]: unknown;
+		};
+		[key: string]: unknown;
+	};
+
 	export let chatIdProp = '';
 	export let embedded = false;
 	export let embeddedTitle = '';
@@ -142,6 +163,84 @@
 		null;
 
 	let loading = true;
+	let chatDestroyed = false;
+	let loadChatGeneration = 0;
+	const historyWindowRequests = new Map<string, Promise<boolean>>();
+	let showMessageNavigationGeneration = 0;
+	onDestroy(() => {
+		chatDestroyed = true;
+		loadChatGeneration += 1;
+		showMessageNavigationGeneration += 1;
+		historyWindowRequests.clear();
+	});
+
+	const getWindowSavePayload = (payload: any) => {
+		const serialized = serializeChatForWindowSave(payload);
+
+		if (serialized.history && Array.isArray(serialized.messages)) {
+			const loadedMessageIds = new Set(Object.keys(serialized.history.messages ?? {}));
+			serialized.messages = serialized.messages.filter(
+				(message: any) => !message?.id || loadedMessageIds.has(message.id)
+			);
+		}
+
+		return serialized;
+	};
+
+	const updateChatWindow = async (id: string, payload: any) =>
+		await updateChatByIdWindow(localStorage.token, id, getWindowSavePayload(payload));
+
+	const hydrateBranchWindow = async (messageId: string, navigationGeneration: number) => {
+		if (
+			!messageId ||
+			!history?.messageWindow ||
+			$temporaryChatEnabled ||
+			!$chatId ||
+			$chatId.startsWith('local:')
+		) {
+			return true;
+		}
+
+		const requestChatId = $chatId;
+		const requestKey = `${navigationGeneration}:${requestChatId}:${messageId}`;
+		const pendingRequest = historyWindowRequests.get(requestKey);
+		if (pendingRequest) return await pendingRequest;
+
+		const request = (async () => {
+			try {
+				const window = await getChatHistoryWindow(
+					localStorage.token,
+					requestChatId,
+					messageId,
+					DEFAULT_CHAT_MESSAGE_WINDOW
+				);
+				if (
+					!window ||
+					chatDestroyed ||
+					$chatId !== requestChatId ||
+					navigationGeneration !== showMessageNavigationGeneration
+				) {
+					return false;
+				}
+
+				const activeCurrentId = history.currentId;
+				const mergedHistory = mergeChatHistoryWindow(history, window) as ChatHistoryState;
+				mergedHistory.currentId = activeCurrentId;
+				history = mergedHistory;
+				return true;
+			} catch (error) {
+				console.error('Failed to load chat history branch', error);
+				toast.error($i18n.t('Failed to load chat'));
+				return false;
+			} finally {
+				historyWindowRequests.delete(requestKey);
+			}
+		})();
+
+		historyWindowRequests.set(requestKey, request);
+		return await request;
+	};
+
 	$: chatContainerId = embedded ? 'note-chat-container' : 'chat-container';
 	$: messageInputDropzoneId = embedded ? 'note-chat-input-dropzone' : 'chat-pane';
 
@@ -400,7 +499,7 @@
 
 	let chatTasks = [];
 
-	let history = {
+	let history: ChatHistoryState = {
 		messages: {},
 		currentId: null
 	};
@@ -1094,6 +1193,7 @@
 	};
 
 	const showMessage = async (message, scroll = true, save = true) => {
+		const navigationGeneration = ++showMessageNavigationGeneration;
 		const _chatId = JSON.parse(JSON.stringify($chatId));
 		let _messageId = JSON.parse(JSON.stringify(message.id));
 
@@ -1111,6 +1211,9 @@
 			messageChildrenIds = history.messages[_messageId].childrenIds;
 		}
 
+		if (_messageId && !(await hydrateBranchWindow(_messageId, navigationGeneration))) return;
+		if (navigationGeneration !== showMessageNavigationGeneration) return;
+
 		history.currentId = _messageId;
 
 		await tick();
@@ -1126,8 +1229,8 @@
 		await tick();
 		await tick();
 
-		if (save) {
-			saveChatHandler(_chatId, history);
+		if (save && !readOnly) {
+			await saveChatHandler(_chatId, history);
 		}
 	};
 
@@ -1240,15 +1343,29 @@
 						message.done = true;
 					}
 				} else if (type === 'chat:message:delta' || type === 'message') {
-					message.content += data.content;
-				} else if (type === 'chat:message' || type === 'replace') {
-					message.content = data.content;
+					message.content = `${message.content ?? ''}${data?.content ?? ''}`;
+				} else if (type === 'chat:message') {
+					message = mergeChatMessageEvent(message, data);
+				} else if (type === 'replace') {
+					message = mergeChatMessageEvent(message, data, true);
 				} else if (type === 'chat:message:files' || type === 'files') {
-					message.files = data.files;
+					const files = data?.files ?? [];
+					message.files = data?.replace
+						? files
+						: [...(message.files ?? []), ...files].filter(
+								(item, index, array) =>
+									array.findIndex((candidate) => equal(candidate, item)) === index
+							);
 				} else if (type === 'chat:message:tasks') {
 					chatTasks = data.tasks;
 				} else if (type === 'chat:message:embeds' || type === 'embeds') {
-					message.embeds = data.embeds;
+					const embeds = data?.embeds ?? [];
+					message.embeds = data?.replace
+						? embeds
+						: [...(message.embeds ?? []), ...embeds].filter(
+								(item, index, array) =>
+									array.findIndex((candidate) => equal(candidate, item)) === index
+							);
 
 					// Auto-scroll to the embed once it's rendered in the DOM
 					await tick();
@@ -1293,7 +1410,7 @@
 					}
 					await refreshChatList(localStorage.token);
 				} else if (type === 'chat:tags') {
-					chat = await getChatById(localStorage.token, $chatId);
+					chat = await getChatByIdWindow(localStorage.token, $chatId, DEFAULT_CHAT_MESSAGE_WINDOW);
 					allTags.set(await getAllTags(localStorage.token));
 				} else if (type === 'source' || type === 'citation') {
 					if (data?.type === 'code_execution') {
@@ -2235,9 +2352,11 @@
 	};
 
 	const loadChat = async () => {
+		const requestGeneration = ++loadChatGeneration;
+		const requestChatId = chatIdProp || $chatId;
 		noteChatDebug('loadChat start');
 		// chatIdProp is empty for chats started from the home page (URL set via replaceState)
-		chatId.set(chatIdProp || $chatId);
+		chatId.set(requestChatId);
 		noteChatDebug('loadChat set active chat id');
 
 		if ($temporaryChatEnabled) {
@@ -2245,18 +2364,26 @@
 			temporaryChatEnabled.set(false);
 		}
 
-		chat = await getChatById(localStorage.token, $chatId).catch(async (error) => {
-			console.error('[note-chat] getChatById failed', {
+		const loadedChat = await getChatByIdWindow(
+			localStorage.token,
+			requestChatId,
+			DEFAULT_CHAT_MESSAGE_WINDOW
+		).catch(async (error) => {
+			console.error('[note-chat] getChatByIdWindow failed', {
 				chatIdProp,
 				activeChatId: $chatId,
 				error
 			});
-			if (!embedded) {
+			if (!embedded && requestGeneration === loadChatGeneration) {
 				await goto('/');
 			}
 			return null;
 		});
-		noteChatDebug('getChatById completed', {
+		if (chatDestroyed || requestGeneration !== loadChatGeneration || $chatId !== requestChatId) {
+			return false;
+		}
+		chat = loadedChat;
+		noteChatDebug('getChatByIdWindow completed', {
 			found: !!chat,
 			chatId: chat?.id,
 			hasChatPayload: !!chat?.chat,
@@ -2264,7 +2391,7 @@
 		});
 
 		if (chat) {
-			tags = await getTagsById(localStorage.token, $chatId).catch(async (error) => {
+			tags = await getTagsById(localStorage.token, requestChatId).catch(async (error) => {
 				console.warn('[note-chat] getTagsById failed; continuing without tags', {
 					chatIdProp,
 					activeChatId: $chatId,
@@ -2272,6 +2399,9 @@
 				});
 				return [];
 			});
+			if (chatDestroyed || requestGeneration !== loadChatGeneration || $chatId !== requestChatId) {
+				return false;
+			}
 			noteChatDebug('getTagsById completed', { tagCount: tags?.length ?? 0 });
 
 			const chatContent = chat.chat;
@@ -2306,9 +2436,7 @@
 					(chatContent?.history ?? undefined) !== undefined
 						? chatContent.history
 						: convertMessagesToHistory(chatContent.messages);
-				if (chat?.current_message_id && history?.messages?.[chat.current_message_id]) {
-					history.currentId = chat.current_message_id;
-				}
+				history.currentId = resolveLoadedCurrentMessageId(history, chat?.current_message_id);
 
 				// Sanitize history: repair orphaned references and structurally-malformed
 				// nodes from failed regenerations (#24424, #24157, #20474)
@@ -2332,6 +2460,7 @@
 					for (const message of Object.values(history.messages)) {
 						if (
 							message &&
+							isChatMessageLoaded(history, message.id) &&
 							message.role === 'assistant' &&
 							message.id !== history.currentId &&
 							message.done !== false
@@ -2346,7 +2475,7 @@
 				// work (follow-ups, title gen) that shouldn't block the input.
 				const activeTaskIds = taskIds;
 				const currentMessage = history.currentId ? history.messages[history.currentId] : null;
-				const pendingTaskIds = await getTaskIdsByChatId(localStorage.token, $chatId)
+				const pendingTaskIds = await getTaskIdsByChatId(localStorage.token, requestChatId)
 					.then((res) => res?.task_ids ?? [])
 					.catch((error) => {
 						console.warn('[note-chat] getTaskIdsByChatId failed; continuing without tasks', {
@@ -2356,6 +2485,13 @@
 						});
 						return [];
 					});
+				if (
+					chatDestroyed ||
+					requestGeneration !== loadChatGeneration ||
+					$chatId !== requestChatId
+				) {
+					return false;
+				}
 				noteChatDebug('task reconciliation completed', {
 					pendingTaskCount: pendingTaskIds.length,
 					hasCurrentMessage: !!currentMessage
@@ -2392,7 +2528,7 @@
 				return null;
 			}
 		}
-		console.warn('[note-chat] no chat returned from getChatById', {
+		console.warn('[note-chat] no chat returned from getChatByIdWindow', {
 			chatIdProp,
 			activeChatId: $chatId
 		});
@@ -2576,7 +2712,7 @@
 
 		if ($chatId == _chatId) {
 			if (!$temporaryChatEnabled) {
-				chat = await updateChatById(localStorage.token, _chatId, {
+				chat = await updateChatWindow(_chatId, {
 					models: selectedModels,
 					messages: messages,
 					history: history,
@@ -3195,14 +3331,14 @@
 
 	const sendMessage = async (
 		_history,
-		parentId: string,
+		parentId: string | null,
 		{
-			messages = null,
+			messagesFromId = null,
 			modelId = null,
 			modelIdx = null,
 			regenerationPrompt = null
 		}: {
-			messages?: any[] | null;
+			messagesFromId?: string | null;
 			modelId?: string | null;
 			modelIdx?: number | null;
 			regenerationPrompt?: string | null;
@@ -3213,7 +3349,9 @@
 		}
 
 		let _chatId = JSON.parse(JSON.stringify($chatId));
-		_history = structuredClone(_history);
+		_history = structuredClone(history);
+		const messages =
+			$temporaryChatEnabled && messagesFromId ? createMessagesList(_history, messagesFromId) : null;
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
 		// If modelId is provided, use it, else use selected model
@@ -3348,7 +3486,8 @@
 						// regenerations in a duplicate-model chat, which would otherwise lose their
 						// column identity and collapse on reload.
 						messageIdsList: messageIdsList.length > 0 ? messageIdsList : undefined,
-						regenerationPrompt
+						regenerationPrompt,
+						regenerationSourceMessageId: regenerationPrompt ? messagesFromId : null
 					}
 				);
 			} finally {
@@ -3403,25 +3542,28 @@
 		{
 			messageIdsList,
 			regenerationPrompt,
+			regenerationSourceMessageId,
 			continueResponse = false
 		}: {
 			messageIdsList?: Array<{ model_id: string; message_id: string }>;
 			regenerationPrompt?: string | null;
+			regenerationSourceMessageId?: string | null;
 			continueResponse?: boolean;
 		} = {}
 	) => {
 		const responseMessage = _history.messages[responseMessageId];
 		const userMessage = _history.messages[responseMessage.parentId];
 
-		const chatMessageFiles = _messages
-			.filter((message) => message.files)
-			.flatMap((message) => message.files);
+		if ($temporaryChatEnabled) {
+			const chatMessageFiles = _messages
+				.filter((message) => message.files)
+				.flatMap((message) => message.files);
 
-		// Filter chatFiles to only include files that are in the chatMessageFiles
-		chatFiles = chatFiles.filter((item) => {
-			const fileExists = chatMessageFiles.some((messageFile) => messageFile.id === item.id);
-			return fileExists;
-		});
+			// Temporary chats have no server-side branch to recover attachment state from.
+			chatFiles = chatFiles.filter((item) =>
+				chatMessageFiles.some((messageFile) => messageFile.id === item.id)
+			);
+		}
 
 		let files = structuredClone(chatFiles);
 		files.push(
@@ -3590,6 +3732,9 @@
 				parent_id: userMessage?.parentId ?? null,
 				user_message: userMessage,
 				...(regenerationPrompt ? { regeneration_prompt: regenerationPrompt } : {}),
+				...(regenerationSourceMessageId
+					? { regeneration_source_message_id: regenerationSourceMessageId }
+					: {}),
 				...(continueResponse ? { assistant_message_id: responseMessageId } : {}),
 
 				background_tasks: {
@@ -3665,7 +3810,7 @@
 						// chat completion request.  Files are now persisted
 						// by the backend at chat creation time.
 						if (Object.keys(params).length > 0) {
-							await updateChatById(localStorage.token, res.chat_id, {
+							await updateChatWindow(res.chat_id, {
 								params: params
 							});
 						}
@@ -3824,7 +3969,7 @@
 			await sendMessage(history, userMessage.id, {
 				...(suggestionPrompt
 					? {
-							messages: createMessagesList(history, message.id),
+							messagesFromId: message.id,
 							regenerationPrompt: suggestionPrompt
 						}
 					: {}),
@@ -3969,7 +4114,7 @@
 	const saveChatHandler = async (_chatId, history) => {
 		if ($chatId == _chatId) {
 			if (!$temporaryChatEnabled) {
-				chat = await updateChatById(localStorage.token, _chatId, {
+				chat = await updateChatWindow(_chatId, {
 					models: selectedModels,
 					history: history,
 					messages: createMessagesList(history, history.currentId),
@@ -3985,7 +4130,7 @@
 		const loaded = chat?.chat ?? {};
 		if (equal(params, loaded.params ?? {}) && equal(chatFiles, loaded.files ?? [])) return;
 
-		const res = await updateChatById(localStorage.token, $chatId, {
+		const res = await updateChatWindow($chatId, {
 			params,
 			files: chatFiles
 		}).catch((err) => {
