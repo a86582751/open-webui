@@ -6,13 +6,13 @@
 	import Modal from '$lib/components/common/Modal.svelte';
 	import SearchInput from './Sidebar/SearchInput.svelte';
 	import {
-		getChatById,
+		getChatByIdWindow,
 		getChatList,
 		getChatListBySearchText,
 		cloneChatById,
 		deleteChatById,
 		archiveChatById,
-		updateChatById,
+		updateChatByIdWindow,
 		updateChatFolderIdById,
 		markChatUnreadById,
 		getAllTags
@@ -174,7 +174,7 @@
 			return;
 		}
 
-		await updateChatById(localStorage.token, editingChatId, { title: trimmed });
+		await updateChatByIdWindow(localStorage.token, editingChatId, { title: trimmed });
 
 		if (chatList) {
 			chatList = chatList.map((c) => (c.id === editingChatId ? { ...c, title: trimmed } : c));
@@ -194,7 +194,7 @@
 		if (!editingChatId || generating) return;
 
 		generating = true;
-		const chat = await getChatById(localStorage.token, editingChatId).catch(() => null);
+		const chat = await getChatByIdWindow(localStorage.token, editingChatId).catch(() => null);
 
 		if (!chat) {
 			toast.error($i18n.t('Failed to load chat'));
@@ -285,6 +285,7 @@
 	let messages = null;
 	let messagesContainerElement: HTMLElement | null = null;
 	const messagesContainerId = 'chat-preview';
+	let previewLoadToken = 0;
 
 	const searchFilterPrefixes = ['tag:', 'folder:', 'pinned:', 'archived:', 'shared:'];
 
@@ -346,6 +347,8 @@
 	};
 
 	const loadChatPreview = async (selectedIdx) => {
+		const loadToken = ++previewLoadToken;
+
 		if (!chatList || chatList.length === 0 || selectedIdx === null) {
 			selectedChat = null;
 			messages = null;
@@ -365,9 +368,10 @@
 
 		const chatId = chatList[selectedChatIdx].id;
 
-		const chat = await getChatById(localStorage.token, chatId).catch(async (error) => {
+		const chat = await getChatByIdWindow(localStorage.token, chatId).catch(async (error) => {
 			return null;
 		});
+		if (loadToken !== previewLoadToken) return;
 
 		if (chat) {
 			selectedChat = chat;
@@ -550,6 +554,7 @@
 	});
 
 	onDestroy(() => {
+		previewLoadToken += 1;
 		if (searchDebounceTimeout) {
 			clearTimeout(searchDebounceTimeout);
 		}
@@ -902,7 +907,7 @@
 					<div class="w-full h-full flex flex-col">
 						<Messages
 							className="h-full flex pt-4 pb-8 w-full"
-							chatId={`chat-preview-${selectedChat?.id ?? ''}`}
+							chatId={selectedChat?.id ?? ''}
 							user={$user}
 							readOnly={true}
 							{selectedModels}

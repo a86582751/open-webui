@@ -44,7 +44,7 @@
 	import {
 		getAllTags,
 		toggleChatPinnedStatusById,
-		getChatById,
+		getChatByIdWindow,
 		updateChatFolderIdById,
 		importChats,
 		deleteAllChats,
@@ -1410,7 +1410,7 @@
 							const { type, id, item } = e.detail;
 
 							if (type === 'chat') {
-								let chat = await getChatById(localStorage.token, id).catch((error) => {
+								let chat = await getChatByIdWindow(localStorage.token, id, 1).catch((error) => {
 									return null;
 								});
 								if (!chat && item) {
@@ -1509,7 +1509,7 @@
 											const { type, id, item } = e.detail;
 
 											if (type === 'chat') {
-												let chat = await getChatById(localStorage.token, id).catch((error) => {
+											let chat = await getChatByIdWindow(localStorage.token, id, 1).catch((error) => {
 													return null;
 												});
 												if (!chat && item) {

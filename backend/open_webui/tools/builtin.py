@@ -21,7 +21,8 @@ from open_webui.env import (
 )
 from open_webui.events import EVENTS, publish_event
 from open_webui.models.channels import Channel, ChannelMember, Channels
-from open_webui.models.chats import Chats, chat_search_content_query, chat_search_terms
+from open_webui.models.chat_messages import ChatMessages
+from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.models.groups import Groups
 from open_webui.models.memories import Memories
@@ -68,6 +69,7 @@ from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.notifications import notify_target
 from open_webui.utils.sanitize import sanitize_code
+from open_webui.utils.misc import expand_messages_with_output, get_content_from_message
 
 log = logging.getLogger(__name__)
 
@@ -688,7 +690,7 @@ async def execute_code(
                         'id': str(uuid4()),
                         'code': code,
                         'session_id': (__metadata__.get('session_id') if __metadata__ else None),
-                        'files': (__metadata__.get('files', []) if __metadata__ else []),
+                        'files': ((__metadata__.get('files') or []) if __metadata__ else []),
                     },
                 }
             )
@@ -1540,36 +1542,9 @@ async def search_chats(
             if end_timestamp and chat.updated_at > end_timestamp:
                 continue
 
-            # Find a matching message snippet
-            snippet = ''
-            messages = (getattr(chat, 'chat', None) or {}).get('history', {}).get('messages', {})
-            if not messages:
-                messages = (getattr(chat, 'chat', None) or {}).get('messages', {}) or {}
-            if isinstance(messages, list):
-                messages = {str(idx): message for idx, message in enumerate(messages)}
-
-            lower_query = chat_search_content_query(query)
-            needles = list(dict.fromkeys([lower_query, *chat_search_terms(lower_query)])) if lower_query else []
-
-            for needle in needles:
-                for msg_id, msg in messages.items():
-                    content = msg.get('content', '') if isinstance(msg, dict) else ''
-                    if isinstance(content, str) and needle in content.lower():
-                        idx = content.lower().find(needle)
-                        start = max(0, idx - 50)
-                        end = min(len(content), idx + len(needle) + 100)
-                        snippet = (
-                            ('...' if start > 0 else '')
-                            + content[start:end]
-                            + ('...' if end < len(content) else '')
-                        )
-                        break
-                if snippet:
-                    break
-
-            title = chat.title or ''
-            if not snippet and any(needle in title.lower() for needle in needles):
-                snippet = f'Title match: {title}'
+            snippet = chat.snippet or ''
+            if not snippet and query.lower() in chat.title.lower():
+                snippet = f'Title match: {chat.title}'
 
             results.append(
                 {
@@ -1610,34 +1585,20 @@ async def view_chat(
     try:
         user_id = __user__.get('id')
 
-        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id, include_messages=False)
 
         if not chat:
             return JSONCodec.dumps({'error': 'Chat not found or access denied'})
 
-        # Extract messages from history
-        messages = []
         history = chat.chat.get('history', {})
-        msg_dict = history.get('messages', {})
-
-        # Build message chain from currentId
         current_id = history.get('currentId')
-        visited = set()
-
-        while current_id and current_id not in visited:
-            visited.add(current_id)
-            msg = msg_dict.get(current_id)
-            if msg:
-                messages.append(
-                    {
-                        'role': msg.get('role', ''),
-                        'content': msg.get('content', ''),
-                    }
-                )
-            current_id = msg.get('parentId') if msg else None
-
-        # Reverse to get chronological order
-        messages.reverse()
+        branch = await ChatMessages.get_message_branch_by_chat_id(chat_id, current_id) if current_id else []
+        messages = [
+            {'role': message.get('role', ''), 'content': content}
+            for message in expand_messages_with_output(branch)
+            for content in [get_content_from_message(message)]
+            if isinstance(content, str) and content.strip()
+        ]
 
         return JSONCodec.dumps(
             {
