@@ -46,6 +46,19 @@ jobs:
       - name: Install backend test dependencies
         run: uv sync --frozen --group dev --no-install-project
 
+      - name: Validate a single migration head
+        working-directory: backend/open_webui
+        env:
+          PYTHONPATH: ${{ github.workspace }}/backend
+          WEBUI_SECRET_KEY: migration-head-check-only-not-production
+        run: >-
+          uv run --no-sync python -c
+          "from alembic.config import Config;
+          from alembic.script import ScriptDirectory;
+          heads = ScriptDirectory.from_config(Config('alembic.ini')).get_heads();
+          assert len(heads) == 1, f'Expected one Alembic head, found: {heads}';
+          print(f'Alembic head: {heads[0]}')"
+
       - name: Run lazy history backend tests
         env:
           PYTHONPATH: backend
