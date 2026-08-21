@@ -38,6 +38,7 @@ def test_expand_messages_with_output_preserves_tool_result_and_final_text():
     assert expanded[2]['content'] == 'tool result'
     assert expanded[3]['content'] == 'final answer'
     assert all('output' not in message for message in expanded)
+    assert 'status' not in messages[1]['output'][0]
 
 
 def test_expand_messages_with_output_keeps_plain_message_without_output_field():

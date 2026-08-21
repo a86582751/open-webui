@@ -531,8 +531,30 @@ def expand_messages_with_output(
     expanded = []
     for message in messages:
         if message.get('role') == 'assistant' and message.get('output'):
+            output = message['output']
+            result_call_ids = {
+                item.get('call_id')
+                for item in output
+                if item.get('type') == 'function_call_output' and item.get('call_id')
+            }
+            if result_call_ids:
+                # Older stored responses did not always mark a call completed even
+                # though its result was already present. Preserve those tool pairs
+                # without replaying genuinely unfinished calls.
+                output = [
+                    {
+                        **item,
+                        'status': 'completed',
+                    }
+                    if item.get('type') == 'function_call'
+                    and not item.get('status')
+                    and item.get('call_id') in result_call_ids
+                    else item
+                    for item in output
+                ]
+
             output_messages = convert_output_to_messages(
-                message['output'],
+                output,
                 raw=raw,
                 reasoning_format=reasoning_format,
                 flatten_tool_images=flatten_tool_images,
