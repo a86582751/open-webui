@@ -2,8 +2,10 @@
 	// Persists across mount/unmount cycles (module-level, not per-instance)
 	let savedPath = '/';
 	let savedFileRoot = null;
-	const treeExpandedCache = new Map<string, string[]>();
-	const treeContentsCache = new Map<string, [string, any[]][]>();
+	/** @type {Map<string, string[]>} */
+	const treeExpandedCache = new Map();
+	/** @type {Map<string, [string, any[]][]>} */
+	const treeContentsCache = new Map();
 </script>
 
 <script lang="ts">
@@ -19,9 +21,11 @@
 	import {
 		getCwd,
 		getTerminalConfig,
+		getFileMatches,
 		listFiles,
 		readFile,
 		downloadFileBlob,
+		downloadFilePreview,
 		archiveFromTerminal,
 		uploadToTerminal,
 		createDirectory,
@@ -29,11 +33,15 @@
 		moveEntry,
 		setCwd,
 		type FileEntry,
+		type TerminalContentMatch,
+		type TerminalFileMatch,
 		type TerminalFileRoot,
 		type TerminalCwd
 	} from '$lib/apis/terminal';
 	import { isCodeFile } from '$lib/utils/codeHighlight';
 	import { isSavedChatId, isTemporaryChatId } from '$lib/utils/chatId';
+	import { copyToClipboard } from '$lib/utils';
+	import { normalizeDocumentTargetPage } from '$lib/utils/documentPreview';
 
 	import Spinner from '../common/Spinner.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
@@ -106,6 +114,12 @@
 		depth: number;
 		rowIndex: number;
 	};
+	type FileSearchTarget = {
+		line: number;
+		column: number;
+		length: number;
+		requestId: number;
+	};
 
 	let sortBy: SortMode = 'name';
 	let sortAsc = true;
@@ -115,6 +129,22 @@
 	let treeCache: Map<string, FileEntry[]> = new Map();
 	let loadingDirs: Set<string> = new Set();
 	let directoryMenu: { x: number; y: number } | null = null;
+	let searchQuery = '';
+	let matchResults: TerminalFileMatch[] | null = null;
+	let matchLoading = false;
+	let matchLoadingMore = false;
+	let matchError: string | null = null;
+	let matchLoadMoreError = false;
+	let nextMatchOffset: number | null = null;
+	let matchTimer: ReturnType<typeof setTimeout> | null = null;
+	let matchController: AbortController | null = null;
+	let matchRequestId = 0;
+	let searchTargetRequestId = 0;
+
+	$: searchText = searchQuery.trim();
+	$: isSearching = Boolean(searchText);
+	$: filenameMatches = matchResults?.filter((match) => match.name_match) ?? [];
+	$: contentOnlyMatches = matchResults?.filter((match) => !match.name_match) ?? [];
 
 	/** Normalize Windows backslashes and collapse duplicate separators. */
 	const normalizePath = (path: string) => path.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
@@ -276,6 +306,8 @@
 	let fileDocxData: ArrayBuffer | null = null;
 	let fileLoading = false;
 	let filePreviewRef: FilePreview;
+	let fileSearchTarget: FileSearchTarget | null = null;
+	let documentTargetPage: number | null = null;
 
 	// ── Office preview state ────────────────────────────────────────────
 	let fileOfficeHtml: string | null = null;
@@ -447,6 +479,139 @@
 		directoryMenu = null;
 	};
 
+	const parentDirectoryPath = (path: string) => {
+		const normalized = normalizePath(path);
+		const slash = normalized.lastIndexOf('/');
+		return slash > 0 ? asDirectoryPath(normalized.slice(0, slash)) : '/';
+	};
+
+	const relativeParentPath = (path: string) => {
+		const slash = path.lastIndexOf('/');
+		return slash === -1 ? '' : path.slice(0, slash);
+	};
+
+	const clearMatchRequest = () => {
+		if (matchTimer) {
+			clearTimeout(matchTimer);
+			matchTimer = null;
+		}
+		matchController?.abort();
+		matchController = null;
+	};
+
+	const resetMatches = () => {
+		matchResults = null;
+		matchLoading = false;
+		matchLoadingMore = false;
+		matchError = null;
+		matchLoadMoreError = false;
+		nextMatchOffset = null;
+	};
+
+	const queueFileSearch = (
+		query: string,
+		terminal: { url: string; key: string } | null,
+		path: string,
+		hiddenVisible: boolean,
+		activeFile: string | null,
+		activePort: number | null
+	) => {
+		clearMatchRequest();
+		matchRequestId += 1;
+		const requestId = matchRequestId;
+		if (!query || !terminal || activeFile || activePort !== null) {
+			resetMatches();
+			return;
+		}
+
+		clearSelection();
+		closeDirectoryMenu();
+		creatingFolder = false;
+		creatingFile = false;
+		matchLoading = true;
+		matchLoadingMore = false;
+		matchError = null;
+		matchLoadMoreError = false;
+		nextMatchOffset = null;
+		matchResults = null;
+		const controller = new AbortController();
+		matchController = controller;
+		matchTimer = setTimeout(async () => {
+			const data = await getFileMatches(
+				terminal.url,
+				terminal.key,
+				query,
+				path,
+				hiddenVisible,
+				0,
+				chatId ?? undefined,
+				controller.signal
+			);
+			if (requestId !== matchRequestId) return;
+			if (data) {
+				matchResults = data.results;
+				nextMatchOffset = data.next_offset;
+			} else if (!controller.signal.aborted) {
+				matchError = $i18n.t('Failed to search files');
+				matchResults = [];
+			}
+			matchLoading = false;
+		}, 200);
+	};
+
+	$: queueFileSearch(
+		searchText,
+		selectedTerminal,
+		currentPath,
+		showHidden,
+		selectedFile,
+		previewPort
+	);
+
+	const loadMoreMatches = async () => {
+		const offset = nextMatchOffset;
+		if (offset === null || !isSearching || matchLoading || matchLoadingMore || matchLoadMoreError) {
+			return;
+		}
+		const terminal = selectedTerminal;
+		if (!terminal) return;
+
+		const requestId = matchRequestId;
+		matchLoadingMore = true;
+		const controller = new AbortController();
+		matchController = controller;
+		const data = await getFileMatches(
+			terminal.url,
+			terminal.key,
+			searchText,
+			currentPath,
+			showHidden,
+			offset,
+			chatId ?? undefined,
+			controller.signal
+		);
+		if (requestId === matchRequestId) {
+			if (data) {
+				matchResults = [...(matchResults ?? []), ...data.results];
+				nextMatchOffset = data.next_offset;
+			} else if (!controller.signal.aborted) {
+				matchLoadMoreError = true;
+			}
+			matchLoadingMore = false;
+		}
+	};
+
+	const loadMoreOnVisible = (node: HTMLElement) => {
+		const observer = new IntersectionObserver(
+			([entry]) => {
+				if (entry.isIntersecting) void loadMoreMatches();
+			},
+			{ rootMargin: '160px' }
+		);
+		observer.observe(node);
+		return { destroy: () => observer.disconnect() };
+	};
+
 	const labelFromPath = (path: string) => {
 		const parts = normalizePath(path).split('/').filter(Boolean);
 		return parts.at(-1) ?? '/';
@@ -475,35 +640,14 @@
 		return isInsideFileRoot(path) ? asDirectoryPath(path) : fileRoot.path;
 	};
 
-	const rootFromCwd = (cwd: TerminalCwd | null, pathHint?: string) => {
-		const cwdPath = cwd?.cwd ? asDirectoryPath(cwd.cwd) : null;
-		const homePath = cwd?.home ? asDirectoryPath(cwd.home) : null;
-		const hintPath = pathHint ? asDirectoryPath(pathHint) : null;
+	const rootFromCwd = (cwd: TerminalCwd | null) => {
 		const rootPath = cwd?.root?.path ? asDirectoryPath(cwd.root.path) : null;
-
-		if (rootPath && rootPath !== '/') return cwd?.root;
-
-		const knownRoot = fileRoot ?? savedFileRoot;
-		if (
-			knownRoot?.path &&
-			hintPath &&
-			hintPath !== '/' &&
-			(hintPath === knownRoot.path || hintPath.startsWith(knownRoot.path))
-		) {
-			return knownRoot;
-		}
-
-		const pathForHome = hintPath && hintPath !== '/' ? hintPath : cwdPath;
-		if (homePath && pathForHome && (pathForHome === homePath || pathForHome.startsWith(homePath))) {
-			return { path: homePath, label: 'Home' };
-		}
-
-		return undefined;
+		return rootPath && rootPath !== '/' ? cwd?.root : undefined;
 	};
 
-	const applyCwd = (cwd: TerminalCwd | null, pathHint?: string) => {
+	const applyCwd = (cwd: TerminalCwd | null) => {
 		const cwdPath = cwd?.cwd ? asDirectoryPath(cwd.cwd) : null;
-		setFileRoot(rootFromCwd(cwd, pathHint));
+		setFileRoot(rootFromCwd(cwd));
 		const path = cwdPath ?? fileRoot?.path ?? '/';
 		return clampToFileRoot(path);
 	};
@@ -538,6 +682,8 @@
 
 	// ── File preview management ──────────────────────────────────────────
 	const clearFilePreview = () => {
+		fileSearchTarget = null;
+		documentTargetPage = null;
 		fileContent = null;
 		if (fileImageUrl) {
 			URL.revokeObjectURL(fileImageUrl);
@@ -657,7 +803,7 @@
 		}
 	};
 
-	const openEntry = async (entry: FileEntry) => {
+	const openEntry = async (entry: FileEntry, options: { page?: unknown } = {}) => {
 		const fullPath =
 			'fullPath' in entry ? (entry as BrowserRow).fullPath : entryPath(currentPath, entry);
 		const parentPath = 'parentPath' in entry ? (entry as BrowserRow).parentPath : currentPath;
@@ -679,6 +825,7 @@
 		selectedFile = filePath;
 		fileLoading = true;
 		clearFilePreview();
+		documentTargetPage = normalizeDocumentTargetPage(options.page);
 
 		if (isImage(filePath)) {
 			const result = await downloadFileBlob(
@@ -721,19 +868,38 @@
 			);
 			if (result) fileSqliteData = await result.blob.arrayBuffer();
 		} else if (isOffice(filePath)) {
-			const result = await downloadFileBlob(
-				terminal.url,
-				terminal.key,
-				filePath,
-				chatId ?? undefined
-			);
-			if (result) {
-				const ext = getFileExt(filePath);
-				const arrayBuffer = await result.blob.arrayBuffer();
-				try {
-					if (ext === 'docx') {
+			const ext = getFileExt(filePath);
+			try {
+				if (ext === 'docx') {
+					const preview = await downloadFilePreview(
+						terminal.url,
+						terminal.key,
+						filePath,
+						chatId ?? undefined
+					);
+					if (preview) {
+						filePdfData = await preview.blob.arrayBuffer();
+					} else {
+						const result = await downloadFileBlob(
+							terminal.url,
+							terminal.key,
+							filePath,
+							chatId ?? undefined
+						);
+						if (!result) throw new Error('Preview failed');
+						const arrayBuffer = await result.blob.arrayBuffer();
 						fileDocxData = arrayBuffer;
-					} else if (ext === 'xlsx') {
+						toast.info($i18n.t('Preview may differ from download.'));
+					}
+				} else if (ext === 'xlsx') {
+					const result = await downloadFileBlob(
+						terminal.url,
+						terminal.key,
+						filePath,
+						chatId ?? undefined
+					);
+					if (result) {
+						const arrayBuffer = await result.blob.arrayBuffer();
 						const XLSX = await import('xlsx');
 						const wb = XLSX.read(new Uint8Array(arrayBuffer), { type: 'array' });
 						excelWorkbook = wb;
@@ -745,21 +911,67 @@
 							const DOMPurify = (await import('dompurify')).default;
 							fileOfficeHtml = DOMPurify.sanitize(result.html);
 						}
-					} else if (ext === 'pptx') {
-						const { pptxToImages } = await import('$lib/utils/pptxToHtml');
-						const result = await pptxToImages(arrayBuffer);
-						fileOfficeSlides = result.images;
-						currentSlide = 0;
 					}
-				} catch (e) {
-					console.error('Failed to render Office file:', e);
-					fileContent = `Error previewing file: ${e instanceof Error ? e.message : 'Unknown error'}`;
+				} else if (ext === 'pptx') {
+					const preview = await downloadFilePreview(
+						terminal.url,
+						terminal.key,
+						filePath,
+						chatId ?? undefined
+					);
+					if (preview) {
+						filePdfData = await preview.blob.arrayBuffer();
+					} else {
+						const result = await downloadFileBlob(
+							terminal.url,
+							terminal.key,
+							filePath,
+							chatId ?? undefined
+						);
+						if (!result) throw new Error('Preview failed');
+						const arrayBuffer = await result.blob.arrayBuffer();
+						const { pptxToImages } = await import('$lib/utils/pptxToHtml');
+						const fallback = await pptxToImages(arrayBuffer);
+						fileOfficeSlides = fallback.images;
+						currentSlide = 0;
+						toast.info($i18n.t('Preview may differ from download.'));
+					}
 				}
+			} catch (e) {
+				console.error('Failed to render Office file:', e);
+				fileContent = `Error previewing file: ${e instanceof Error ? e.message : 'Unknown error'}`;
 			}
 		} else {
 			fileContent = await readFile(terminal.url, terminal.key, filePath, chatId ?? undefined);
 		}
 		fileLoading = false;
+	};
+
+	const openFileMatch = async (match: TerminalFileMatch) => {
+		if (match.type === 'directory') {
+			searchQuery = '';
+			await loadDir(match.path);
+			return;
+		}
+		await openEntry({
+			name: match.name,
+			type: 'file',
+			size: 0,
+			fullPath: match.path,
+			parentPath: parentDirectoryPath(match.path),
+			depth: 0,
+			rowIndex: -1
+		} as BrowserRow);
+	};
+
+	const openContentMatch = async (match: TerminalFileMatch, contentMatch: TerminalContentMatch) => {
+		await openFileMatch(match);
+		fileSearchTarget = {
+			line: contentMatch.line,
+			column: contentMatch.column,
+			length: searchText.length,
+			requestId: ++searchTargetRequestId
+		};
 	};
 
 	let downloading = false;
@@ -1137,10 +1349,12 @@
 
 		let handledDisplayFile = false;
 
-		const unsubFileNav = showFileNavPath.subscribe(async (filePath) => {
-			if (!filePath || !selectedTerminal) return;
+		const unsubFileNav = showFileNavPath.subscribe(async (request) => {
+			if (!request || !selectedTerminal) return;
 			handledDisplayFile = true;
 			showFileNavPath.set(null);
+			let filePath = typeof request === 'string' ? request : request.path;
+			const targetPage = typeof request === 'string' ? null : request.page;
 			filePath = normalizePath(filePath);
 			if (!isInsideFileRoot(filePath)) {
 				await loadDir(fileRoot?.path ?? '/');
@@ -1157,10 +1371,10 @@
 
 			const entry = entries.find((e) => e.name === fileName);
 			if (entry) {
-				await openEntry(entry);
+				await openEntry(entry, { page: targetPage });
 			} else {
 				// File may not be in listing; open it directly
-				await openEntry({ name: fileName, type: 'file', size: 0 });
+				await openEntry({ name: fileName, type: 'file', size: 0 }, { page: targetPage });
 			}
 		});
 
@@ -1175,6 +1389,7 @@
 
 			const lastSlash = filePath.lastIndexOf('/');
 			const dir = lastSlash > 0 ? filePath.substring(0, lastSlash + 1) : '/';
+			invalidateTreeCache(dir);
 
 			if (selectedFile) {
 				if (selectedFile === filePath || currentPath.startsWith(dir)) {
@@ -1183,7 +1398,7 @@
 				}
 			} else {
 				if (currentPath.startsWith(dir) || dir.startsWith(currentPath)) {
-					await loadDir(currentPath, { preserveTree: true });
+					await refreshBrowser();
 				}
 			}
 		});
@@ -1198,7 +1413,7 @@
 
 				const serverCwd = await getCwd(terminal.url, terminal.key, chatId ?? undefined);
 				const useServerPath = !!chatId || savedPath === '/';
-				const serverPath = applyCwd(serverCwd, useServerPath ? undefined : savedPath);
+				const serverPath = applyCwd(serverCwd);
 				if (useServerPath) {
 					// Fetch session-specific cwd from the server (or global default for new chats)
 					savedPath = serverPath;
@@ -1246,6 +1461,7 @@
 	});
 
 	onDestroy(() => {
+		clearMatchRequest();
 		if (fileImageUrl) URL.revokeObjectURL(fileImageUrl);
 		if (fileVideoUrl) URL.revokeObjectURL(fileVideoUrl);
 		if (fileAudioUrl) URL.revokeObjectURL(fileAudioUrl);
@@ -1301,13 +1517,13 @@
 	<div
 		bind:this={containerEl}
 		class="flex flex-col h-full min-h-0 min-w-0 relative"
-		on:dragover={handleDragOver}
+		on:dragover={(e) => !isSearching && handleDragOver(e)}
 		on:dragleave={() => (isDragOver = false)}
-		on:drop={handleDrop}
+		on:drop={(e) => !isSearching && handleDrop(e)}
 		role="region"
 		aria-label={$i18n.t('File browser')}
 	>
-		{#if isDragOver}
+		{#if isDragOver && !isSearching}
 			<div
 				class="absolute inset-1 z-10 flex items-center justify-center rounded-lg border-2 border-dashed border-blue-400 bg-blue-500/10 dark:border-blue-500 pointer-events-none"
 			>
@@ -1458,8 +1674,9 @@
 						<button
 							class="shrink-0 flex h-5 w-5 items-center justify-center rounded transition-colors duration-100 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300"
 							on:click={async () => {
-								await navigator.clipboard.writeText(fileContent ?? '');
-								toast.success($i18n.t('Copied to clipboard'));
+								if (await copyToClipboard(fileContent ?? '')) {
+									toast.success($i18n.t('Copied to clipboard'));
+								}
 							}}
 							aria-label={$i18n.t('Copy')}
 						>
@@ -1478,8 +1695,31 @@
 				</Tooltip>
 			</FileNavToolbar>
 
+			{#if !selectedFile}
+				<div
+					class="flex h-8 shrink-0 items-center gap-1.5 border-b border-gray-50 px-3 dark:border-gray-850/30"
+				>
+					<Icon name="search" size={13} strokeWidth={1.5} class="shrink-0 text-gray-400" />
+					<input
+						type="text"
+						class="min-w-0 flex-1 border-none bg-transparent text-xs text-gray-800 outline-none placeholder:text-gray-400 dark:text-gray-200 dark:placeholder:text-gray-600"
+						placeholder={$i18n.t('Search files and contents')}
+						bind:value={searchQuery}
+					/>
+					{#if searchQuery}
+						<button
+							class="flex shrink-0 items-center text-gray-400 transition hover:text-gray-600 dark:hover:text-gray-300"
+							on:click={() => (searchQuery = '')}
+							aria-label={$i18n.t('Clear search')}
+						>
+							<Icon name="xmark" size={11} strokeWidth={1.5} />
+						</button>
+					{/if}
+				</div>
+			{/if}
+
 			<!-- Bulk action bar -->
-			{#if selectedCount > 0}
+			{#if selectedCount > 0 && !isSearching}
 				<BulkActionBar
 					count={selectedCount}
 					canDelete={selectedEntriesWritable}
@@ -1502,7 +1742,7 @@
 				if (e.target === e.currentTarget && selectedCount > 0) clearSelection();
 			}}
 			on:contextmenu={(e) => {
-				if (selectedFile || previewPort !== null) return;
+				if (selectedFile || previewPort !== null || isSearching) return;
 				if ((e.target as HTMLElement)?.closest('[data-file-row]')) return;
 				e.preventDefault();
 				directoryMenu = { x: e.clientX, y: e.clientY };
@@ -1536,8 +1776,10 @@
 					{fileContent}
 					{fileOfficeHtml}
 					{fileOfficeSlides}
+					targetPage={documentTargetPage}
 					{excelSheetNames}
 					{selectedExcelSheet}
+					searchTarget={fileSearchTarget}
 					onSheetChange={async (sheet) => {
 						if (!excelWorkbook) return;
 						selectedExcelSheet = sheet;
@@ -1563,7 +1805,125 @@
 					}}
 				/>
 			{:else}
-				{#if uploading}
+				{#if isSearching}
+					{#if matchLoading}
+						<div class="flex justify-center pt-8"><Spinner className="size-4" /></div>
+					{:else if matchError}
+						<div class="flex items-center justify-center py-12">
+							<div class="text-xs text-gray-400 dark:text-gray-500">{matchError}</div>
+						</div>
+					{:else if !matchResults?.length}
+						<div class="flex items-center justify-center py-12">
+							<div class="text-xs text-gray-400 dark:text-gray-500">{$i18n.t('No matches')}</div>
+						</div>
+					{:else}
+						{#if filenameMatches.length > 0}
+							<div
+								class="px-2 pt-1 pb-0.5 text-[0.625rem] font-medium uppercase tracking-wide text-gray-400 dark:text-gray-600"
+							>
+								{$i18n.t('Filename matches')}
+							</div>
+							{#each filenameMatches as match (match.path)}
+								<button
+									class="flex h-7 w-full items-center gap-2 rounded-lg px-2 text-left transition-colors duration-75 hover:bg-gray-50 dark:hover:bg-white/4"
+									on:click={() => openFileMatch(match)}
+								>
+									<FileTypeIcon name={match.name} type={match.type} />
+									<span class="min-w-0 flex-1 truncate text-xs text-gray-800 dark:text-gray-200">
+										{match.name}
+										{#if relativeParentPath(match.relative_path)}
+											<span class="ml-1.5 text-[0.6875rem] text-gray-400 dark:text-gray-600">
+												{relativeParentPath(match.relative_path)}
+											</span>
+										{/if}
+									</span>
+								</button>
+								{#if match.content_matches.length > 0}
+									{@const preview = match.content_matches[0]}
+									<button
+										class="flex h-6 w-full items-center gap-2 rounded-lg pl-8 pr-2 text-left transition-colors duration-75 hover:bg-gray-50 dark:hover:bg-white/4"
+										on:click={() => openContentMatch(match, preview)}
+									>
+										<span
+											class="w-6 shrink-0 text-right font-mono text-[0.625rem] text-gray-400 dark:text-gray-600"
+											>{preview.line}</span
+										>
+										<span
+											class="min-w-0 flex-1 truncate font-mono text-[0.6875rem] text-gray-500 dark:text-gray-500"
+											>{preview.text}</span
+										>
+										{#if match.content_matches.length > 1}
+											<span class="shrink-0 text-[0.625rem] text-gray-400 dark:text-gray-600">
+												+{match.content_matches.length - 1}
+											</span>
+										{/if}
+									</button>
+								{/if}
+							{/each}
+						{/if}
+
+						{#if contentOnlyMatches.length > 0}
+							<div
+								class="px-2 pt-2 pb-0.5 text-[0.625rem] font-medium uppercase tracking-wide text-gray-400 dark:text-gray-600"
+							>
+								{$i18n.t('Content matches')}
+							</div>
+							{#each contentOnlyMatches as match (match.path)}
+								<button
+									class="flex h-7 w-full items-center gap-2 rounded-lg px-2 text-left transition-colors duration-75 hover:bg-gray-50 dark:hover:bg-white/4"
+									on:click={() => openFileMatch(match)}
+								>
+									<FileTypeIcon name={match.name} type={match.type} />
+									<span class="min-w-0 flex-1 truncate text-xs text-gray-800 dark:text-gray-200">
+										{match.name}
+										{#if relativeParentPath(match.relative_path)}
+											<span class="ml-1.5 text-[0.6875rem] text-gray-400 dark:text-gray-600">
+												{relativeParentPath(match.relative_path)}
+											</span>
+										{/if}
+									</span>
+								</button>
+								{#if match.content_matches.length > 0}
+									{@const preview = match.content_matches[0]}
+									<button
+										class="flex h-6 w-full items-center gap-2 rounded-lg pl-8 pr-2 text-left transition-colors duration-75 hover:bg-gray-50 dark:hover:bg-white/4"
+										on:click={() => openContentMatch(match, preview)}
+									>
+										<span
+											class="w-6 shrink-0 text-right font-mono text-[0.625rem] text-gray-400 dark:text-gray-600"
+											>{preview.line}</span
+										>
+										<span
+											class="min-w-0 flex-1 truncate font-mono text-[0.6875rem] text-gray-500 dark:text-gray-500"
+											>{preview.text}</span
+										>
+										{#if match.content_matches.length > 1}
+											<span class="shrink-0 text-[0.625rem] text-gray-400 dark:text-gray-600">
+												+{match.content_matches.length - 1}
+											</span>
+										{/if}
+									</button>
+								{/if}
+							{/each}
+						{/if}
+
+						{#if nextMatchOffset !== null}
+							<div use:loadMoreOnVisible class="flex h-8 items-center justify-center">
+								{#if matchLoadingMore}
+									<Spinner className="size-3" />
+								{:else if matchLoadMoreError}
+									<button
+										class="text-[0.6875rem] text-gray-400 transition-colors duration-75 hover:text-gray-600 dark:text-gray-600 dark:hover:text-gray-400"
+										on:click={() => {
+											matchLoadMoreError = false;
+											void loadMoreMatches();
+										}}>{$i18n.t('Retry')}</button
+									>
+								{/if}
+							</div>
+						{/if}
+					{/if}
+				{:else if uploading}
 					<div class="flex items-center justify-center gap-2 p-4 text-xs text-gray-500">
 						<Spinner className="size-4" />
 						{$i18n.t('Uploading...')}
@@ -1580,7 +1940,7 @@
 					</div>
 				{/if}
 
-				{#if !loading && !error && !uploading && !($selectedTerminalId && $terminalServers === null)}
+				{#if !isSearching && !loading && !error && !uploading && !($selectedTerminalId && $terminalServers === null)}
 					{#if creatingFolder}
 						<div class="flex h-7 items-center gap-2 px-2">
 							<FileTypeIcon name={newFolderName} type="directory" />
@@ -1662,7 +2022,7 @@
 		</div>
 
 		<!-- Port detection -->
-		{#if selectedTerminal && !selectedFile && previewPort === null}
+		{#if selectedTerminal && !selectedFile && previewPort === null && !isSearching}
 			<div class="shrink-0 border-t border-gray-50 dark:border-gray-850/30">
 				<PortList
 					baseUrl={selectedTerminal.url}

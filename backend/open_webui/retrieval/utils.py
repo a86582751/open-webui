@@ -24,6 +24,7 @@ from open_webui.config import (
     RAG_EMBEDDING_QUERY_PREFIX,
     VECTOR_DB,
 )
+from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import (
     AIOHTTP_CLIENT_ALLOW_REDIRECTS,
     AIOHTTP_CLIENT_SESSION_SSL,
@@ -50,8 +51,12 @@ from open_webui.retrieval.vector.main import GetResult, SearchResult
 from open_webui.retrieval.web.utils import get_web_loader
 from open_webui.utils.access_control.files import get_owner_accessible_folder_files, has_access_to_file
 from open_webui.utils.access_control.folders import has_folder_access
-from open_webui.utils.headers import include_user_info_headers
-from open_webui.utils.misc import expand_messages_with_output, get_content_from_message
+from open_webui.utils.headers import get_json_bearer_headers, include_user_info_headers
+from open_webui.utils.misc import (
+    expand_messages_with_output,
+    get_content_from_message,
+    get_message_list,
+)
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +73,7 @@ def is_youtube_url(url: str) -> bool:
 
 
 LOADER_CONFIG_KEYS = {
+    'file_max_size': 'rag.file.max_size',
     'youtube_language': 'rag.youtube_loader_language',
     'youtube_proxy_url': 'rag.youtube_loader_proxy_url',
     'web_loader_ssl_verification': 'web.loader.ssl_verification',
@@ -103,6 +109,7 @@ LOADER_CONFIG_KEYS = {
     'EXTERNAL_DOCUMENT_LOADER_API_KEY': 'rag.external_document_loader_api_key',
     'EXTERNAL_DOCUMENT_LOADER_HEADERS': 'rag.external_document_loader_headers',
     'TIKA_SERVER_URL': 'rag.tika_server_url',
+    'TIKA_SERVER_VERSION': 'rag.tika_server_version',
     'DOCLING_SERVER_URL': 'rag.docling_server_url',
     'DOCLING_API_KEY': 'rag.docling_api_key',
     'DOCLING_PARAMS': 'rag.docling_params',
@@ -151,6 +158,7 @@ def build_loader_from_config(request, config: dict):
     from open_webui.retrieval.loaders.main import Loader
 
     loader_config = {key: config.get(key) for key in LOADER_CONFIG_KEYS if key.isupper()}
+    loader_config['FILE_MAX_SIZE'] = config.get('file_max_size')
     return Loader(
         engine=loader_config['CONTENT_EXTRACTION_ENGINE'],
         **{key: value for key, value in loader_config.items() if key != 'CONTENT_EXTRACTION_ENGINE'},
@@ -183,11 +191,20 @@ def _extract_text_from_binary_response(
 
     suffix = '.' + filename.split('.')[-1].lower() if '.' in filename else ''
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
+    max_size = loader_config.get('file_max_size')
+    max_bytes = int(max_size) * 1024 * 1024 if max_size else 0
 
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     try:
+        downloaded = 0
+        # Stream to disk; response.content buffers the whole body in memory first.
+        with os.fdopen(tmp_fd, 'wb') as tmp:
+            for chunk in response.iter_content(64 * 1024):
+                downloaded += len(chunk)
+                if max_bytes and downloaded > max_bytes:
+                    raise ValueError(ERROR_MESSAGES.FILE_TOO_LARGE(size=f'{max_size} MB'))
+                tmp.write(chunk)
+
         loader = build_loader_from_config(request, loader_config)
         docs = loader.load(filename, content_type, tmp_path)
         for doc in docs:
@@ -198,14 +215,24 @@ def _extract_text_from_binary_response(
         os.remove(tmp_path)
 
 
+TEXT_APPLICATION_CONTENT_TYPES = {
+    'application/javascript',
+    'application/json',
+    'application/xml',
+    'application/x-javascript',
+}
+
+
 def _is_text_content_type(content_type: str) -> bool:
     """Return True if the content type should be handled by the web loader."""
     ct = content_type.split(';')[0].strip().lower()
+    if not ct:
+        return True
     if ct.startswith('text/'):
         return True
-    if any(t in ct for t in ['xml', 'json', 'javascript']):
+    if ct in TEXT_APPLICATION_CONTENT_TYPES:
         return True
-    return not ct  # empty / missing → assume HTML
+    return ct.endswith(('+xml', '+json'))
 
 
 async def get_content_from_url(request, url: str) -> str:
@@ -632,7 +659,7 @@ def merge_and_sort_query_results(query_results: list[dict], k: int) -> dict:
             if isinstance(document, str):
                 doc_hash = (metadata or {}).get(CHUNK_HASH_KEY) or _content_hash(document)
 
-                if doc_hash not in combined.keys():
+                if doc_hash not in combined:
                     combined[doc_hash] = (distance, document, metadata)
                     continue  # if doc is new, no further comparison is needed
 
@@ -870,10 +897,7 @@ def generate_openai_batch_embeddings(
     if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
         json_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {key}',
-    }
+    headers = get_json_bearer_headers(key)
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
 
@@ -903,10 +927,7 @@ async def agenerate_openai_batch_embeddings(
     if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
         form_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {key}',
-    }
+    headers = get_json_bearer_headers(key)
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
 
@@ -1022,10 +1043,7 @@ def generate_ollama_batch_embeddings(
     if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
         json_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {key}',
-    }
+    headers = get_json_bearer_headers(key)
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
 
@@ -1058,10 +1076,7 @@ async def agenerate_ollama_batch_embeddings(
     if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
         form_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {key}',
-    }
+    headers = get_json_bearer_headers(key)
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
 

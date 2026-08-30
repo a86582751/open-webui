@@ -16,6 +16,7 @@ from open_webui.env import (
     GLOBAL_LOG_LEVEL,
     REDIS_KEY_PREFIX,
     WEBSOCKET_EVENT_CALLER_TIMEOUT,
+    WEBSOCKET_HEARTBEAT_INTERVAL,
     WEBSOCKET_MANAGER,
     WEBSOCKET_REDIS_CLUSTER,
     WEBSOCKET_REDIS_LOCK_TIMEOUT,
@@ -102,7 +103,7 @@ else:
 
 # Timeout duration in seconds
 TIMEOUT_DURATION = 3
-SESSION_POOL_TIMEOUT = 120  # seconds without heartbeat before session is reaped
+SESSION_POOL_TIMEOUT = max(WEBSOCKET_HEARTBEAT_INTERVAL * 4, 120) if WEBSOCKET_HEARTBEAT_INTERVAL is not None else 120
 
 # Dictionary to maintain the user pool
 
@@ -121,6 +122,7 @@ if WEBSOCKET_MANAGER == 'redis':
         redis_url=WEBSOCKET_REDIS_URL,
         redis_sentinels=ws_sentinels,
         redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+        cache_set_signature=True,
     )
 
     SESSION_POOL = RedisDict(
@@ -803,11 +805,6 @@ async def yjs_document_update(sid, data):
                 log.warning(f'User {user.get("id")} does not have write access to note {note_id}. Rejecting update.')
                 return
 
-        try:
-            await stop_item_tasks(REDIS, document_id)
-        except Exception:
-            pass
-
         user_id = data.get('user_id', sid)
 
         update = data['update']  # List of bytes from frontend
@@ -835,6 +832,16 @@ async def yjs_document_update(sid, data):
             await document_save_handler(document_id, data.get('data', {}), user)
 
         if data.get('data'):
+            # Only drop the pending save when a new one takes its place.
+            # Updates without a content snapshot (the resync a client sends
+            # after rejoining a document) would otherwise cancel the pending
+            # save without scheduling a replacement, so the edits made just
+            # before the resync never reach the database.
+            try:
+                await stop_item_tasks(REDIS, document_id)
+            except Exception:
+                pass
+
             await create_task(REDIS, debounced_save(), document_id)
 
     except Exception as e:
@@ -1088,7 +1095,6 @@ async def get_event_emitter(request_info, update_db=True):
                         embeds,
                         deduplicate=True,
                     )
-
             elif event_type == 'files':
                 event_payload = event_data.get('data', {})
                 files = event_payload.get('files') or []

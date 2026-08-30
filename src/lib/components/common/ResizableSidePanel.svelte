@@ -5,16 +5,39 @@
 	export let side: 'left' | 'right' = 'right';
 	export let width = 350;
 	export let minWidth = 300;
-	export let maxWidth = 640;
+	export let maxWidth: number | null = null;
+	export let minSiblingWidth = 0;
+	export let closeOnDragBelowMinWidth = false;
 	export let storageKey = '';
 	export let className = '';
 	export let resizerId = 'controls-resizer';
+	export let onClose: () => void = () => {};
 
+	let panelElement: HTMLDivElement | null = null;
 	let isResizing = false;
+	let activePointerId: number | null = null;
+	let activeResizer: HTMLElement | null = null;
 	let startClientX = 0;
 	let startWidth = 0;
 
-	const clamp = (value: number) => Math.min(maxWidth, Math.max(minWidth, value));
+	const getMaxWidth = () => {
+		const siblingMaxWidth =
+			minSiblingWidth > 0 && panelElement?.parentElement
+				? Math.max(0, panelElement.parentElement.clientWidth - minSiblingWidth)
+				: null;
+
+		if (maxWidth === null) {
+			return siblingMaxWidth;
+		}
+		return siblingMaxWidth === null ? maxWidth : Math.min(maxWidth, siblingMaxWidth);
+	};
+
+	const clamp = (value: number) => {
+		const resolvedMaxWidth = getMaxWidth();
+		const minimum = resolvedMaxWidth === null ? minWidth : Math.min(minWidth, resolvedMaxWidth);
+		const clampedToMin = Math.max(minimum, value);
+		return resolvedMaxWidth === null ? clampedToMin : Math.min(resolvedMaxWidth, clampedToMin);
+	};
 
 	const persistWidth = () => {
 		if (storageKey) {
@@ -22,26 +45,49 @@
 		}
 	};
 
-	const resizeStartHandler = (e: MouseEvent) => {
+	const close = () => {
+		open = false;
+		onClose();
+	};
+
+	const resizeStartHandler = (e: PointerEvent) => {
 		if (!open) return;
 
+		e.preventDefault();
 		isResizing = true;
+		activePointerId = e.pointerId;
+		activeResizer = e.currentTarget as HTMLElement;
+		activeResizer.setPointerCapture?.(e.pointerId);
 		startClientX = e.clientX;
 		startWidth = width;
 		document.body.style.userSelect = 'none';
 	};
 
-	const resizeEndHandler = () => {
+	const resizeEndHandler = (e?: PointerEvent) => {
 		if (!isResizing) return;
+		if (e && activePointerId !== null && e.pointerId !== activePointerId) return;
 
 		isResizing = false;
+		if (activePointerId !== null) {
+			if (activeResizer?.hasPointerCapture?.(activePointerId)) {
+				activeResizer.releasePointerCapture(activePointerId);
+			}
+		}
+		activePointerId = null;
+		activeResizer = null;
 		document.body.style.userSelect = '';
 		persistWidth();
 	};
 
 	const resizeHandler = (endClientX: number) => {
 		const dx = endClientX - startClientX;
-		width = clamp(side === 'right' ? startWidth - dx : startWidth + dx);
+		const nextWidth = side === 'right' ? startWidth - dx : startWidth + dx;
+		if (closeOnDragBelowMinWidth && nextWidth < minWidth) {
+			close();
+			resizeEndHandler();
+			return;
+		}
+		width = clamp(nextWidth);
 	};
 
 	const resizeKeyHandler = (e: KeyboardEvent) => {
@@ -62,6 +108,13 @@
 		}
 	});
 
+	$: if (open && panelElement) {
+		const clampedWidth = clamp(width);
+		if (clampedWidth !== width) {
+			width = clampedWidth;
+		}
+	}
+
 	onDestroy(() => {
 		if (isResizing) {
 			document.body.style.userSelect = '';
@@ -70,11 +123,16 @@
 </script>
 
 <svelte:window
-	on:mousemove={(e) => {
+	on:pointermove={(e) => {
 		if (!isResizing) return;
+		if (activePointerId !== null && e.pointerId !== activePointerId) return;
 		resizeHandler(e.clientX);
 	}}
-	on:mouseup={resizeEndHandler}
+	on:resize={() => {
+		if (open) width = clamp(width);
+	}}
+	on:pointerup={resizeEndHandler}
+	on:pointercancel={resizeEndHandler}
 />
 
 {#if open}
@@ -83,7 +141,7 @@
 		<div
 			class="relative flex items-center justify-center group border-l border-gray-50 dark:border-gray-850/30 hover:border-gray-200 dark:hover:border-gray-800 transition z-20 bg-transparent p-0 appearance-none"
 			id={resizerId}
-			on:mousedown={resizeStartHandler}
+			on:pointerdown={resizeStartHandler}
 			on:keydown={resizeKeyHandler}
 			role="separator"
 			tabindex="0"
@@ -92,11 +150,12 @@
 		>
 			<span
 				class="absolute -left-1.5 -right-1.5 -top-0 -bottom-0 z-20 cursor-col-resize bg-transparent"
+				style="touch-action: none;"
 			></span>
 		</div>
 	{/if}
 
-	<div class={className} style="width: {width}px; flex: 0 0 {width}px;">
+	<div bind:this={panelElement} class={className} style="width: {width}px; flex: 0 0 {width}px;">
 		<slot />
 	</div>
 
@@ -105,7 +164,7 @@
 		<div
 			class="relative flex items-center justify-center group border-r border-gray-50 dark:border-gray-850/30 hover:border-gray-200 dark:hover:border-gray-800 transition z-20 bg-transparent p-0 appearance-none"
 			id={resizerId}
-			on:mousedown={resizeStartHandler}
+			on:pointerdown={resizeStartHandler}
 			on:keydown={resizeKeyHandler}
 			role="separator"
 			tabindex="0"
@@ -114,6 +173,7 @@
 		>
 			<span
 				class="absolute -left-1.5 -right-1.5 -top-0 -bottom-0 z-20 cursor-col-resize bg-transparent"
+				style="touch-action: none;"
 			></span>
 		</div>
 	{/if}

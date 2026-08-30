@@ -46,6 +46,7 @@
 		testExternalKnowledgeRetrieval
 	} from '$lib/apis/knowledge';
 	import { processUrl } from '$lib/apis/retrieval';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
 	import { blobToFile, copyToClipboard } from '$lib/utils';
 	import { computeFileHash } from '$lib/utils/hash';
@@ -909,6 +910,10 @@
 		}
 	};
 
+	const openFileHandler = (fileId: string) => {
+		window.open(`${WEBUI_API_BASE_URL}/files/${encodeURIComponent(fileId)}/content`, '_blank');
+	};
+
 	let debounceTimeout = null;
 
 	let dragged = false;
@@ -1399,12 +1404,14 @@
 										type="button"
 										on:click={() => {
 											includeContent = !includeContent;
+											currentPage = 1;
 										}}
 									>
 										<Checkbox
 											state={includeContent ? 'checked' : 'unchecked'}
 											on:change={(e) => {
 												includeContent = e.detail === 'checked';
+												currentPage = 1;
 											}}
 										/>
 										{$i18n.t('File content')}
@@ -1472,6 +1479,7 @@
 									} else {
 										delete localStorage.workspaceViewOption;
 									}
+									currentPage = 1;
 								}}
 							/>
 
@@ -1615,8 +1623,18 @@
 													<ChevronLeft strokeWidth="2.5" />
 												</button>
 											</div>
-											<div class=" flex-1 text-sm line-clamp-1">
-												{selectedFile?.meta?.name}
+											<div class="flex-1 text-sm line-clamp-1">
+												<a
+													href="#"
+													class="hover:underline line-clamp-1"
+													on:click|preventDefault={() => {
+														if (selectedFile?.id) {
+															openFileHandler(selectedFile.id);
+														}
+													}}
+												>
+													{selectedFile?.meta?.name}
+												</a>
 											</div>
 
 											{#if knowledge?.write_access}

@@ -35,6 +35,7 @@
 		user as _user,
 		showControls,
 		showSettings,
+		showFileNavDir,
 		selectedTerminalId,
 		TTSWorker,
 		temporaryChatEnabled
@@ -51,6 +52,7 @@
 		getCurrentDateTime,
 		getFormattedDate,
 		getFormattedTime,
+		getUsageTokenCount,
 		getUserPosition,
 		getUserTimezone,
 		getWeekday
@@ -65,7 +67,6 @@
 	import { getSessionUser } from '$lib/apis/auths';
 
 	import { WEBUI_BASE_URL, WEBUI_API_BASE_URL, PASTED_TEXT_CHARACTER_LIMIT } from '$lib/constants';
-	import { initiateOAuthRedirect } from '$lib/apis/configs';
 	import { matchKeybinding, Shortcut } from '$lib/shortcuts';
 
 	import { createNoteHandler } from '../notes/utils';
@@ -178,11 +179,11 @@
 				!($_user?.permissions?.chat?.temporary_enforced ?? false)));
 
 	export let prompt = '';
-	export let files = [];
+	export let files: any[] = [];
 
-	export let selectedToolIds = [];
-	export let selectedSkillIds = [];
-	export let selectedFilterIds = [];
+	export let selectedToolIds: string[] = [];
+	export let selectedSkillIds: string[] = [];
+	export let selectedFilterIds: string[] = [];
 
 	export let imageGenerationEnabled = false;
 	export let webSearchEnabled = false;
@@ -190,7 +191,13 @@
 	export let toolApprovalMode = 'full';
 	export let onToolApprovalModeChange: Function = () => {};
 
-	export let pendingOAuthTools = [];
+	export let pendingOAuthTools: {
+		id: string;
+		name?: string;
+		serverId: string;
+		authType?: string | null;
+	}[] = [];
+	export let oauthRedirectHandler: Function = () => {};
 
 	let showTerminalMenu = false;
 
@@ -219,7 +226,8 @@
 		integrationsMenuCloseOnOutsideClick = true;
 	}
 
-	$: onChange({
+	let chatInputDraft: any;
+	$: chatInputDraft = {
 		prompt,
 		files: files
 			.filter((file) => file.type !== 'image')
@@ -237,7 +245,9 @@
 		webSearchEnabled,
 		codeInterpreterEnabled,
 		toolApprovalMode
-	});
+	};
+
+	$: onChange(chatInputDraft);
 
 	const inputVariableHandler = async (text: string): Promise<string> => {
 		inputVariables = extractInputVariables(text);
@@ -481,13 +491,10 @@
 
 		for (let idx = activeMessages.length - 1; idx >= 0; idx -= 1) {
 			const usage = activeMessages[idx]?.usage ?? activeMessages[idx]?.info?.usage;
-			const inputTokens = usage?.input_tokens ?? usage?.prompt_tokens;
-			if (inputTokens) {
+			const usageTokens = getUsageTokenCount(usage);
+			if (usageTokens) {
 				hasUsageCheckpoint = true;
-				estimatedTokens =
-					Number(inputTokens || 0) +
-					Number(usage.output_tokens ?? usage.completion_tokens ?? 0) +
-					estimateMessagesTokens(activeMessages.slice(idx + 1));
+				estimatedTokens = usageTokens + estimateMessagesTokens(activeMessages.slice(idx + 1));
 				break;
 			}
 		}
@@ -774,6 +781,14 @@
 		'terminal',
 		modelCapabilitiesById
 	);
+	$: hasDirectToolServerAccess =
+		$_user?.role === 'admin' || ($_user?.permissions?.features?.direct_tool_servers ?? true);
+	$: showTerminalSelector =
+		terminalCapableModels.length > 0 &&
+		(($terminalServers ?? []).some((t) => t.id) ||
+			(hasDirectToolServerAccess &&
+				(($terminalServers ?? []).some((t) => !t.id) ||
+					($settings?.terminalServers ?? []).some((s) => s.url))));
 
 	let toggleFilters = [];
 	$: toggleFilters = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels)
@@ -875,10 +890,7 @@
 
 		return (
 			(settingsValue?.terminalServers ?? []).find(
-				(t: any) =>
-					t.url === selectedId &&
-					t.enabled &&
-					t.config?.chat_uploads === 'filesystem'
+				(t: any) => t.url === selectedId && t.enabled && t.config?.chat_uploads === 'filesystem'
 			) ?? null
 		);
 	};
@@ -924,11 +936,13 @@
 		if (filesystemUploadTerminal) {
 			try {
 				const cwd =
-					(await getCwd(
-						filesystemUploadTerminal.url,
-						filesystemUploadTerminal.key,
-						chatId || undefined
-					))?.cwd || '/';
+					(
+						await getCwd(
+							filesystemUploadTerminal.url,
+							filesystemUploadTerminal.key,
+							chatId || undefined
+						)
+					)?.cwd || '/';
 				const uploadedFile = await uploadToTerminal(
 					filesystemUploadTerminal.url,
 					filesystemUploadTerminal.key,
@@ -938,7 +952,7 @@
 				);
 
 				if (uploadedFile) {
-					fileItem.type = 'terminal_file';
+					fileItem.type = 'filesystem';
 					fileItem.status = 'uploaded';
 					fileItem.id = uploadedFile.path;
 					fileItem.path = uploadedFile.path;
@@ -946,6 +960,7 @@
 					fileItem.size = uploadedFile.size ?? file.size;
 					fileItem.file = uploadedFile;
 					files = files;
+					showFileNavDir.set(uploadedFile.path);
 				} else {
 					fileItem.status = 'error';
 					fileItem.error = $i18n.t('Failed to upload file.');
@@ -1355,6 +1370,26 @@
 								...files,
 								{
 									...data,
+									status: 'processed'
+								}
+							];
+						} else if (type === 'filesystem') {
+							const path = data.path ?? data.url ?? data.id;
+							if (
+								!path ||
+								files.find((f) => f.type === 'filesystem' && (f.path ?? f.url ?? f.id) === path)
+							) {
+								return;
+							}
+							files = [
+								...files,
+								{
+									type: 'filesystem',
+									id: path,
+									path,
+									url: path,
+									name: data.name,
+									size: data.size,
 									status: 'processed'
 								}
 							];
@@ -2232,6 +2267,11 @@
 												bind:webSearchEnabled
 												bind:imageGenerationEnabled
 												bind:codeInterpreterEnabled
+												oauthRedirectHandler={(tool: {
+													id: string;
+													serverId: string;
+													authType?: string | null;
+												}) => oauthRedirectHandler(tool, chatInputDraft)}
 												{onWebSearchToggle}
 												closeOnOutsideClick={integrationsMenuCloseOnOutsideClick}
 												onShowValves={(e) => {
@@ -2451,7 +2491,7 @@
 												<Tooltip content={$i18n.t('Click to connect')} placement="top">
 													<button
 														on:click|preventDefault={() => {
-															initiateOAuthRedirect(pendingTool);
+															oauthRedirectHandler(pendingTool, chatInputDraft);
 														}}
 														type="button"
 														class="group px-2 py-[0.3125rem] flex gap-1.5 items-center text-xs rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden
@@ -2463,20 +2503,20 @@
 												</Tooltip>
 											{/each}
 
-											{#if !history?.currentId || history.messages[history.currentId]?.done == true}
-												<!-- Terminal Server Selector -->
-												{@const hasDirectToolServerAccess =
-													$_user?.role === 'admin' ||
-													($_user?.permissions?.features?.direct_tool_servers ?? true)}
-												{#if terminalCapableModels.length > 0 && (($terminalServers ?? []).some((t) => t.id) || (hasDirectToolServerAccess && (($terminalServers ?? []).some((t) => !t.id) || ($settings?.terminalServers ?? []).some((s) => s.url))))}
-													<TerminalMenu bind:show={showTerminalMenu} />
-												{/if}
+											<!-- Terminal Server Selector -->
+											{#if showTerminalSelector}
+												<TerminalMenu
+													bind:show={showTerminalMenu}
+													disabled={generating ||
+														(!!history?.currentId &&
+															history.messages[history.currentId]?.done != true)}
+												/>
 											{/if}
 										</div>
 									</div>
 								</div>
 
-								<div class="self-end flex space-x-1 mr-1 shrink-0 gap-[0.03125rem]">
+								<div class="self-end flex space-x-1 mr-1 min-w-0 gap-[0.03125rem]">
 									<div class="flex min-w-0 max-w-[10rem] items-center sm:max-w-[13rem]">
 										<ModelSelector
 											bind:this={modelSelector}

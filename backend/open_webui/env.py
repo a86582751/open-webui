@@ -353,12 +353,11 @@ DATABASE_SQLITE_PRAGMA_MMAP_SIZE = os.getenv('DATABASE_SQLITE_PRAGMA_MMAP_SIZE',
 # truncated.  67108864 ≈ 64 MB.  Set to -1 for no limit (SQLite default).
 DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT = os.getenv('DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT', '67108864')
 
-DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = os.getenv('DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL', None)
-if DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL is not None:
-    try:
-        DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = float(DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL)
-    except Exception:
-        DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = 0.0
+# Seconds between presence writes per user per worker; keep under the 180s active-user window. 0 disables.
+try:
+    DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = float(os.getenv('DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL', '60'))
+except ValueError:
+    DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = 60.0
 
 DATABASE_ENABLE_SESSION_SHARING = os.getenv('DATABASE_ENABLE_SESSION_SHARING', 'False').lower() == 'true'
 ENABLE_PUBLIC_ACTIVE_USERS_COUNT = os.getenv('ENABLE_PUBLIC_ACTIVE_USERS_COUNT', 'True').lower() == 'true'
@@ -376,6 +375,11 @@ REDIS_URL = os.getenv('REDIS_URL', '')
 REDIS_CLUSTER = os.getenv('REDIS_CLUSTER', 'False').lower() == 'true'
 
 REDIS_KEY_PREFIX = os.getenv('REDIS_KEY_PREFIX', 'open-webui')
+
+try:
+    REDIS_RESPONSE_STREAM_TTL = int(os.getenv('REDIS_RESPONSE_STREAM_TTL', '3600'))
+except ValueError:
+    REDIS_RESPONSE_STREAM_TTL = 3600
 
 REDIS_SENTINEL_HOSTS = os.getenv('REDIS_SENTINEL_HOSTS', '')
 REDIS_SENTINEL_PORT = os.getenv('REDIS_SENTINEL_PORT', '26379')
@@ -444,6 +448,9 @@ try:
 except (ValueError, TypeError):
     UVICORN_WORKERS = 1
 
+# tiny delta-stream frames make per-frame websocket compression CPU-bound, allow opting out (true/false)
+UVICORN_WS_PER_MESSAGE_DEFLATE = os.getenv('UVICORN_WS_PER_MESSAGE_DEFLATE', 'True').lower() == 'true'
+
 ####################################
 # WEBSOCKET SUPPORT
 ####################################
@@ -499,6 +506,15 @@ try:
     WEBSOCKET_SERVER_PING_INTERVAL = int(WEBSOCKET_SERVER_PING_INTERVAL)
 except ValueError:
     WEBSOCKET_SERVER_PING_INTERVAL = 25
+
+WEBSOCKET_HEARTBEAT_INTERVAL = os.getenv('WEBSOCKET_HEARTBEAT_INTERVAL', '')
+if WEBSOCKET_HEARTBEAT_INTERVAL == '':
+    WEBSOCKET_HEARTBEAT_INTERVAL = None
+else:
+    try:
+        WEBSOCKET_HEARTBEAT_INTERVAL = min(max(int(WEBSOCKET_HEARTBEAT_INTERVAL), 5), 90)
+    except ValueError:
+        WEBSOCKET_HEARTBEAT_INTERVAL = 30
 
 WEBSOCKET_EVENT_CALLER_TIMEOUT = os.getenv('WEBSOCKET_EVENT_CALLER_TIMEOUT', '')
 
@@ -571,6 +587,8 @@ def _parse_ssl_env(value: str) -> 'bool | _ssl.SSLContext':
 
 
 REQUESTS_VERIFY = os.getenv('REQUESTS_VERIFY', 'True').lower() == 'true'
+
+TAVILY_API_BASE_URL = os.getenv('TAVILY_API_BASE_URL', 'https://api.tavily.com').rstrip('/')
 
 _aiohttp_timeout_raw = os.getenv('AIOHTTP_CLIENT_TIMEOUT', '')
 try:
@@ -804,6 +822,16 @@ BYPASS_RETRIEVAL_ACCESS_CONTROL = os.getenv('BYPASS_RETRIEVAL_ACCESS_CONTROL', '
 # for non-admin users.  When False (default), unknown collection names are
 # denied — closing the legacy unscoped namespace.
 ENABLE_RETRIEVAL_UNSCOPED_COLLECTIONS = os.getenv('ENABLE_RETRIEVAL_UNSCOPED_COLLECTIONS', 'False').lower() == 'true'
+
+# Falls back to the upload size limit, because a document cannot legitimately carry more metadata
+# than the file itself is allowed to be. Left unbounded, a small archive that expands enormously
+# during extraction can exhaust memory. RAG_FILE_MAX_SIZE is in MB.
+RAG_METADATA_MAX_VALUE_CHARS = (
+    int(os.getenv('RAG_METADATA_MAX_VALUE_CHARS'))
+    if os.getenv('RAG_METADATA_MAX_VALUE_CHARS')
+    else ((int(os.getenv('RAG_FILE_MAX_SIZE', '0')) or 0) * 1024 * 1024 or None)
+)
+
 MINERU_MAX_MARKDOWN_BYTES = (
     int(os.getenv('MINERU_MAX_MARKDOWN_BYTES')) if os.getenv('MINERU_MAX_MARKDOWN_BYTES') else None
 )

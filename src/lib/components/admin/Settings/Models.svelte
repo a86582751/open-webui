@@ -88,8 +88,8 @@
 	let defaultModelIdSet = new Set<string>();
 	let defaultPinnedModelIdSet = new Set<string>();
 
-	let workspaceModels: ModelListItem[] = [];
 	let baseModels: ModelListItem[] = [];
+	let allModels: ModelListItem[] = [];
 
 	let filteredModels = [];
 	let selectedModelId = null;
@@ -118,6 +118,9 @@
 	};
 
 	const isSharedModel = (model) => (model?.access_grants ?? []).length > 0 && !isPublicModel(model);
+
+	const isPresetModel = (model: any) =>
+		!!(model?.preset || model?.base_model_id || model?.info?.base_model_id);
 
 	const modelAccessLabel = (model) => {
 		if (isPublicModel(model)) {
@@ -264,19 +267,27 @@
 			selectedTag = '';
 		}
 
-		workspaceModels = await getBaseModels(localStorage.token, selectedTag);
-		baseModels = await getModels(localStorage.token, null, true);
-		const workspaceModelIds = new Set<string>(workspaceModels.map((wm: ModelListItem) => wm.id));
+		baseModels = await getBaseModels(localStorage.token, selectedTag);
+		allModels = await getModels(localStorage.token);
 
-		models = baseModels
-			.filter((m: ModelListItem) => !selectedTag || workspaceModelIds.has(m.id))
+		const providerModels = await getModels(localStorage.token, null, true);
+		const allModelIds = new Set<string>(allModels.map((model: ModelListItem) => model.id));
+		allModels = [
+			...allModels,
+			...providerModels.filter((model: ModelListItem) => !allModelIds.has(model.id))
+		];
+
+		const baseModelIds = new Set<string>(baseModels.map((model: ModelListItem) => model.id));
+
+		models = allModels
+			.filter((m: ModelListItem) => !selectedTag || baseModelIds.has(m.id))
 			.map((m: ModelListItem) => {
-				const workspaceModel = workspaceModels.find((wm: ModelListItem) => wm.id === m.id);
+				const baseModel = baseModels.find((model: ModelListItem) => model.id === m.id);
 
-				if (workspaceModel) {
+				if (baseModel) {
 					return {
 						...m,
-						...workspaceModel
+						...baseModel
 					};
 				} else {
 					return {
@@ -455,9 +466,9 @@
 	}
 
 	const upsertModelHandler = async (model, overrides = {}, showToast = true) => {
-		model = { ...model, base_model_id: null, ...overrides };
+		model = { ...model, ...(isPresetModel(model) ? {} : { base_model_id: null }), ...overrides };
 
-		if (workspaceModels.find((m) => m.id === model.id)) {
+		if (baseModels.find((m: ModelListItem) => m.id === model.id) || isPresetModel(model)) {
 			const res = await updateModelById(localStorage.token, model.id, model).catch((error) => {
 				return null;
 			});
@@ -486,7 +497,7 @@
 	};
 
 	const toggleModelHandler = async (model) => {
-		if (!Object.keys(model).includes('base_model_id')) {
+		if (!Object.keys(model).includes('base_model_id') && !isPresetModel(model)) {
 			await createNewModel(localStorage.token, {
 				id: model.id,
 				name: model.name,
@@ -589,9 +600,19 @@
 	};
 
 	const getFullModel = async (model: any) =>
-		workspaceModels.some((workspaceModel) => workspaceModel.id === model.id)
+		baseModels.some((baseModel) => baseModel.id === model.id) || isPresetModel(model)
 			? ((await getModelById(localStorage.token, model.id).catch(() => null)) ?? model)
 			: model;
+
+	const openModelHandler = async (model: any) => {
+		if (isPresetModel(model)) {
+			showSettings.set(false);
+			await goto(`/workspace/models/edit?id=${encodeURIComponent(model.id)}`);
+			return;
+		}
+
+		selectedModelId = model.id;
+	};
 
 	const cloneHandler = async (model) => {
 		model = await getFullModel(model);
@@ -933,7 +954,7 @@
 									class="flex group/item gap-2.5 w-full min-w-0 flex-1 text-left cursor-pointer"
 									type="button"
 									on:click={() => {
-										selectedModelId = model.id;
+										openModelHandler(model);
 									}}
 								>
 									<div class="self-center">
@@ -1105,7 +1126,7 @@
 										type="button"
 										aria-label={$i18n.t('Edit')}
 										on:click={() => {
-											selectedModelId = model.id;
+											openModelHandler(model);
 										}}
 									>
 										<svg

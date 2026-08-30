@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -202,6 +203,20 @@ def enable_iam_token_auth(connectable) -> None:
         return
 
     engine = getattr(connectable, 'sync_engine', connectable)
+    url = engine.url
+    auth = _rds_iam_token_auth
+    # The token is bound to one host/port/user pair; leave other databases on their own credentials.
+    if (url.host, url.port or 5432, url.username) != (auth.host, auth.port, auth.username):
+        log.warning(
+            'AWS RDS IAM token auth not applied to %s: the token is issued for %s@%s:%s, '
+            'so this connection uses the password from its own URL',
+            url.render_as_string(hide_password=True),
+            auth.username,
+            auth.host,
+            auth.port,
+        )
+        return
+
     if not event.contains(engine, 'do_connect', _set_iam_token_password):
         event.listen(engine, 'do_connect', _set_iam_token_password)
 
@@ -307,6 +322,30 @@ elif 'sqlite' in SQLALCHEMY_DATABASE_URL:
 
     def _apply_sqlite_pragmas(dbapi_connection):
         """Apply all configured SQLite PRAGMAs to a raw DBAPI connection."""
+
+        # SQLite LIKE folds ASCII only; SQLAlchemy SQLite ILIKE compiles to lower(x) LIKE lower(?).
+        def like(pattern, value, escape=None):
+            if pattern is None or value is None:
+                return None
+
+            regex = []
+            escaped = False
+            escape = str(escape).lower() if escape is not None else None
+            for char in str(pattern).lower():
+                if escape and not escaped and char == escape:
+                    escaped = True
+                    continue
+                regex.append(
+                    '.*' if not escaped and char == '%' else '.' if not escaped and char == '_' else re.escape(char)
+                )
+                escaped = False
+            if escaped:
+                return False
+
+            return re.fullmatch(''.join(regex), str(value).lower(), re.DOTALL) is not None
+
+        dbapi_connection.create_function('like', 2, like, deterministic=True)
+        dbapi_connection.create_function('like', 3, like, deterministic=True)
         cursor = dbapi_connection.cursor()
         if DATABASE_ENABLE_SQLITE_WAL:
             cursor.execute('PRAGMA journal_mode=WAL')

@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 from copy import deepcopy
+from typing import Any, Literal
 
 # local imports
 from open_webui.env import ENABLE_ADMIN_CHAT_ACCESS
@@ -166,6 +167,7 @@ class Chat(Base):  # database table mapping for chat entity
     current_message_id = Column(Text, nullable=True)
 
     last_read_at = Column(BigInteger, nullable=True)
+    timer_at = Column(BigInteger, nullable=True)  # ns due time, set only while a timer chat waits to be claimed
 
     __table_args__ = (
         # Performance indexes for common queries
@@ -174,6 +176,23 @@ class Chat(Base):  # database table mapping for chat entity
         Index('user_id_archived_idx', 'user_id', 'archived'),
         Index('updated_at_user_id_idx', 'updated_at', 'user_id'),
         Index('folder_id_user_id_idx', 'folder_id', 'user_id'),
+        Index('user_id_updated_at_id_idx', 'user_id', updated_at.desc(), 'id'),
+        Index(
+            'timer_at_idx',
+            'timer_at',
+            sqlite_where=text('timer_at IS NOT NULL'),
+            postgresql_where=text('timer_at IS NOT NULL'),
+        ),
+        # timer_at key column turns the IS NOT NULL into a seek, so this beats the plain user_id indexes
+        Index(
+            'user_id_timer_at_idx',
+            'user_id',
+            'timer_at',
+            sqlite_where=text('timer_at IS NOT NULL'),
+            postgresql_where=text('timer_at IS NOT NULL'),
+        ),
+        # covering index: lets SQLite serve count_unread_by_folder_ids without reading chat rows
+        Index('user_id_folder_unread_idx', 'user_id', 'folder_id', 'archived', 'updated_at', 'last_read_at', 'id'),
     )
 
 
@@ -204,6 +223,7 @@ class ChatModel(BaseModel):
     current_message_id: str | None = None
 
     last_read_at: int | None = None
+    timer_at: int | None = None
 
     @field_validator('variables', mode='before')
     @classmethod
@@ -519,6 +539,7 @@ class ChatTable:
         db: AsyncSession | None = None,
         *,
         internal_meta: dict | None = None,
+        timer_at: int | None = None,
     ) -> ChatModel | None:
         async with get_async_db_context(db) as session:
             clean_chat = self._clean_null_bytes(form_data.chat)
@@ -533,6 +554,7 @@ class ChatTable:
                     'chat': compact_chat,
                     'folder_id': form_data.folder_id,
                     'meta': internal_meta or {},
+                    'timer_at': timer_at,
                     'variables': form_data.variables or {},
                     'current_message_id': self.get_current_message_id(form_data.chat),
                     'created_at': int(time.time()),
@@ -699,7 +721,7 @@ class ChatTable:
         """Persist compact chat metadata and lossless normalized messages."""
         try:  # load the chat record for in-place mutation
             async with get_async_db_context(db) as session:
-                chat_item = await session.get(Chat, id, with_for_update=True)
+                chat_item = await session.get(Chat, id, populate_existing=True, with_for_update=True)
                 if chat_item is None:
                     return None
 
@@ -928,7 +950,12 @@ class ChatTable:
     async def update_chat_title_by_id(self, id: str, title: str) -> ChatModel | None:
         try:
             async with get_async_db_context() as session:
-                chat_item = await session.get(Chat, id)
+                chat_item = await session.get(
+                    Chat,
+                    id,
+                    populate_existing=True,
+                    with_for_update=session.bind.dialect.name == 'postgresql',
+                )
                 if chat_item is None:
                     return None
                 clean_title = self._clean_null_bytes(title)
@@ -989,11 +1016,12 @@ class ChatTable:
     def merge_history(existing_history: dict | None, incoming_history: dict | None) -> dict:
         existing = (existing_history or {}).get('messages') or {}
         incoming = (incoming_history or {}).get('messages') or {}
-        merged = {**existing, **incoming}
-        merged = {message_id: message for message_id, message in merged.items() if isinstance(message, dict)}
+        merged = {
+            message_id: {**message, 'childrenIds': []}
+            for message_id, message in {**existing, **incoming}.items()
+            if isinstance(message, dict)
+        }
 
-        for message in merged.values():
-            message['childrenIds'] = []
         for message_id, message in merged.items():
             parent_id = message.get('parentId')
             if parent_id in merged:
@@ -1249,6 +1277,30 @@ class ChatTable:
             log.exception('Failed to patch message %s for chat %s: %s', message_id, id, exc)
             return None
 
+    async def get_message_metadata(
+        self,
+        chat_id: str,
+        message_id: str,
+        metadata_key: Literal['files', 'sources', 'embeds'],
+    ) -> Any | None:
+        """Read one message metadata field without rebuilding the whole history."""
+        async with get_async_db_context() as db:
+            # Read the column directly; some stored rows cannot be validated as full ChatMessageModel objects.
+            result = await db.execute(
+                select(getattr(ChatMessage, metadata_key)).where(ChatMessage.id == f'{chat_id}-{message_id}')
+            )
+            metadata_row = result.first()
+
+            if metadata_row is not None:
+                return metadata_row[0]
+
+            chat_item = await db.get(Chat, chat_id)
+            if chat_item is None:
+                return None
+
+            message = ((chat_item.chat or {}).get('history') or {}).get('messages', {}).get(message_id, {})
+            return message.get(metadata_key)
+
     async def upsert_message_to_chat_by_id_and_message_id(
         self,
         id: str,
@@ -1270,7 +1322,12 @@ class ChatTable:
 
         try:
             async with get_async_db_context() as session:
-                chat_item = await session.get(Chat, id, with_for_update=True)
+                chat_item = await session.get(
+                    Chat,
+                    id,
+                    populate_existing=True,
+                    with_for_update=True,
+                )
                 if chat_item is None:
                     return None
 
@@ -1400,7 +1457,12 @@ class ChatTable:
         """Delete one message branch using normalized topology only."""
         try:
             async with get_async_db_context(db) as session:
-                chat_item = await session.get(Chat, id, with_for_update=True)
+                chat_item = await session.get(
+                    Chat,
+                    id,
+                    populate_existing=True,
+                    with_for_update=True,
+                )
                 if chat_item is None:
                     return None
 

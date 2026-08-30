@@ -281,7 +281,7 @@
 					? JSON.parse(RAGConfig.EXTERNAL_DOCUMENT_LOADER_HEADERS)
 					: {},
 			CONTENT_EXTRACTION_SUPPORTED_MEDIA_MIME_TYPES:
-				RAGConfig.CONTENT_EXTRACTION_SUPPORTED_MEDIA_MIME_TYPES.trim() === ''
+				RAGConfig.CONTENT_EXTRACTION_SUPPORTED_MEDIA_MIME_TYPES === null
 					? undefined
 					: RAGConfig.CONTENT_EXTRACTION_SUPPORTED_MEDIA_MIME_TYPES.split(',')
 							.map((mimeType: string) => mimeType.trim())
@@ -342,9 +342,8 @@
 				: config.EXTERNAL_DOCUMENT_LOADER_HEADERS;
 
 		config.MINERU_FILE_EXTENSIONS = (config?.MINERU_FILE_EXTENSIONS ?? ['pdf']).join(', ');
-		config.CONTENT_EXTRACTION_SUPPORTED_MEDIA_MIME_TYPES = (
-			config?.CONTENT_EXTRACTION_SUPPORTED_MEDIA_MIME_TYPES ?? []
-		).join(', ');
+		config.CONTENT_EXTRACTION_SUPPORTED_MEDIA_MIME_TYPES =
+			config?.CONTENT_EXTRACTION_SUPPORTED_MEDIA_MIME_TYPES?.join(', ') ?? null;
 		config.RAG_TOKENIZER_MODEL = config?.RAG_TOKENIZER_MODEL ?? '';
 
 		RAGConfig = config;
@@ -654,16 +653,27 @@
 						{/if}
 					</AdminSettingField>
 				{:else if RAGConfig.CONTENT_EXTRACTION_ENGINE === 'tika'}
-					<AdminSettingField
-						label={$i18n.t('Tika Server URL')}
-						description={$i18n.t('Tika server endpoint used for content extraction.')}
-					>
-						<input
-							class={inputClass}
-							placeholder={$i18n.t('Enter Tika Server URL')}
-							bind:value={RAGConfig.TIKA_SERVER_URL}
-						/>
-					</AdminSettingField>
+					<div class="grid grid-cols-1 gap-x-3 gap-y-2.5 sm:grid-cols-2">
+						<AdminSettingField
+							label={$i18n.t('Tika Server URL')}
+							description={$i18n.t('Tika server endpoint used for content extraction.')}
+						>
+							<input
+								class={inputClass}
+								placeholder={$i18n.t('Enter Tika Server URL')}
+								bind:value={RAGConfig.TIKA_SERVER_URL}
+							/>
+						</AdminSettingField>
+						<AdminSettingField
+							label={$i18n.t('Tika Server Version')}
+							description={$i18n.t('Select the Tika server API version.')}
+						>
+							<SettingsSelect bind:value={RAGConfig.TIKA_SERVER_VERSION}>
+								<option value="3">{$i18n.t('Tika 3.x')}</option>
+								<option value="4">{$i18n.t('Tika 4.x')}</option>
+							</SettingsSelect>
+						</AdminSettingField>
+					</div>
 				{:else if RAGConfig.CONTENT_EXTRACTION_ENGINE === 'docling'}
 					<div class="grid grid-cols-1 gap-x-3 gap-y-2.5 sm:grid-cols-2">
 						<AdminSettingField

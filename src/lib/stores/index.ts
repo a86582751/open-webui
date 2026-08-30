@@ -140,7 +140,8 @@ export const showOverview = writable(false);
 export const showArtifacts = writable(false);
 export const showCallOverlay = writable(false);
 export const showFileNav = writable(false);
-export const showFileNavPath: Writable<string | null> = writable(null);
+export type FileNavOpenRequest = string | { path: string; page?: number | null };
+export const showFileNavPath: Writable<FileNavOpenRequest | null> = writable(null);
 export const showFileNavDir: Writable<string | null> = writable(null);
 export const selectedTerminalId: Writable<string | null> = writable(null);
 
@@ -230,6 +231,7 @@ type Settings = {
 	imageCompression?: boolean;
 	imageCompressionSize?: any;
 	textScale?: number;
+	fontFamily?: string | null;
 	widescreenMode?: null;
 	largeTextAsFile?: boolean;
 	promptAutocomplete?: boolean;
@@ -245,11 +247,15 @@ type Settings = {
 	splitLargeChunks?(body: any, splitLargeChunks: any): unknown;
 	backgroundImageUrl?: null;
 	landingPageMode?: string;
+	iframeSandboxAllowScripts?: boolean;
 	iframeSandboxAllowForms?: boolean;
 	iframeSandboxAllowSameOrigin?: boolean;
+	iframeSandboxAllowDownloads?: boolean;
+	terminalPreviewAllowSameOrigin?: boolean;
 	scrollOnBranchChange?: boolean;
 	scrollOnResponseGeneration?: boolean;
 	showFilesOnTerminalSelect?: boolean;
+	terminalFileDisplay?: 'sidebar' | 'inline';
 	directConnections?: null;
 	chatBubble?: boolean;
 	copyFormatted?: boolean;
@@ -351,6 +357,7 @@ type Config = {
 		enable_version_update_check: boolean;
 		enable_pyodide_file_persistence?: boolean;
 		folder_max_file_count?: number;
+		websocket_heartbeat_interval?: number | null;
 	};
 	oauth: {
 		providers: {

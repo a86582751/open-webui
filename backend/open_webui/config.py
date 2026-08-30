@@ -925,6 +925,8 @@ EXTERNAL_DOCUMENT_LOADER_HEADERS = external_document_loader_headers
 
 TIKA_SERVER_URL = os.getenv('TIKA_SERVER_URL', 'http://tika:9998')
 
+TIKA_SERVER_VERSION = os.getenv('TIKA_SERVER_VERSION', '3')
+
 DOCLING_SERVER_URL = os.getenv('DOCLING_SERVER_URL', 'http://docling:5001')
 
 DOCLING_API_KEY = os.getenv('DOCLING_API_KEY', '')
@@ -972,6 +974,8 @@ RAG_FULL_CONTEXT = os.getenv('RAG_FULL_CONTEXT', 'False').lower() == 'true'
 RAG_FILE_MAX_COUNT = int(os.getenv('RAG_FILE_MAX_COUNT')) if os.getenv('RAG_FILE_MAX_COUNT') else None
 
 RAG_FILE_MAX_SIZE = int(os.getenv('RAG_FILE_MAX_SIZE')) if os.getenv('RAG_FILE_MAX_SIZE') else None
+
+ENABLE_KNOWLEDGE_FILE_RETENTION = os.getenv('ENABLE_KNOWLEDGE_FILE_RETENTION', 'False').lower() == 'true'
 
 RAG_FILE_CONTENT_SEARCH_MAX_CHARS = int(os.getenv('RAG_FILE_CONTENT_SEARCH_MAX_CHARS', str(64 * 1024 * 1024)))
 
@@ -1107,12 +1111,26 @@ ENABLE_LOCAL_WEB_FETCH = (
 ENABLE_RAG_LOCAL_WEB_FETCH = ENABLE_LOCAL_WEB_FETCH
 
 
+# Operators extend this through WEB_FETCH_FILTER_LIST.
 DEFAULT_WEB_FETCH_FILTER_LIST = [
     '!169.254.169.254',
     '!fd00:ec2::254',
     '!metadata.google.internal',
     '!metadata.azure.com',
     '!100.100.100.200',
+    '!168.63.129.16',  # Azure platform channel, reachable from every Azure VM
+    '!192.88.99.0/24',  # 6to4 relay anycast, deprecated by RFC 7526
+    '!224.0.0.0/4',  # IPv4 multicast
+    '!::ffff:0:0:0/96',  # IPv4-translated (SIIT, RFC 2765), never routed
+    '!64:ff9b:1::/48',  # NAT64 local-use prefix, RFC 8215, not a public destination
+    '!100:0:0:1::/64',  # dummy prefix, RFC 9780
+    '!2001:1::1',  # PCP anycast, RFC 7723, answered by the local network's own edge device
+    '!2001:1::2',  # TURN anycast, RFC 8155, likewise
+    '!2001:20::/28',  # ORCHIDv2, RFC 7343, never routed
+    '!2001:30::/28',  # DRIP, RFC 9374, never routed
+    '!5f00::/16',  # SRv6 SIDs, RFC 9602, internal to one segment routing domain
+    '!fec0::/10',  # IPv6 site-local, deprecated by RFC 3879
+    '!ff00::/8',  # IPv6 multicast
 ]
 
 web_fetch_filter_list = os.getenv('WEB_FETCH_FILTER_LIST', '')
@@ -2876,6 +2894,7 @@ DEFAULT_CONFIG = {
     'rag.external_document_loader_api_key': EXTERNAL_DOCUMENT_LOADER_API_KEY,
     'rag.external_document_loader_headers': EXTERNAL_DOCUMENT_LOADER_HEADERS,
     'rag.tika_server_url': TIKA_SERVER_URL,
+    'rag.tika_server_version': TIKA_SERVER_VERSION,
     'rag.docling_server_url': DOCLING_SERVER_URL,
     'rag.docling_api_key': DOCLING_API_KEY,
     'rag.docling_params': DOCLING_PARAMS,

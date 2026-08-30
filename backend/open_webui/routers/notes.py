@@ -339,11 +339,10 @@ async def get_note_chat_by_id(
     chat = await Chats.get_internal_chat_by_note_id(note.id, user.id, db=db)
     if chat:
         log.info('[note-chat] reusing hidden chat note_id=%s chat_id=%s user_id=%s', note.id, chat.id, user.id)
-        payload = {**(chat.chat or {})}
-        params = {**(payload.get('params') or {})}
+        params = {**((chat.chat or {}).get('params') or {})}
         changed = False
-
-        if params.pop('note_id', None) is not None:
+        if 'note_id' in params:
+            del params['note_id']
             changed = True
 
         system = (
@@ -356,14 +355,10 @@ async def get_note_chat_by_id(
             params['system'] = system
             changed = True
 
-        if payload.pop('system', None) is not None:
-            changed = True
-
-        payload['params'] = params
         if changed:
             updated_chat = await Chats.update_chat_by_id(
                 chat.id,
-                payload,
+                {'params': params},
                 db=db,
                 touch=False,
                 include_messages=False,
@@ -440,11 +435,10 @@ async def get_note_chats_by_id(
     chats = await Chats.get_internal_chats_by_note_id(note.id, user.id, db=db)
     normalized_chats = []
     for chat in chats:
-        payload = {**(chat.chat or {})}
-        params = {**(payload.get('params') or {})}
+        params = {**((chat.chat or {}).get('params') or {})}
         changed = False
-
-        if params.pop('note_id', None) is not None:
+        if 'note_id' in params:
+            del params['note_id']
             changed = True
 
         system = (
@@ -457,15 +451,11 @@ async def get_note_chats_by_id(
             params['system'] = system
             changed = True
 
-        if payload.pop('system', None) is not None:
-            changed = True
-
-        payload['params'] = params
         if changed:
             chat = (
                 await Chats.update_chat_by_id(
                     chat.id,
-                    payload,
+                    {'params': params},
                     db=db,
                     touch=False,
                     include_messages=False,
